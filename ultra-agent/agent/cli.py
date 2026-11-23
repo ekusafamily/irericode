@@ -61,8 +61,15 @@ def render_agent_message(content: str) -> Panel:
 
 def render_system_message(content: str) -> Panel:
     """Render a system/info message centered."""
+    if isinstance(content, str):
+        try:
+            text = Text.from_markup(content, justify="center")
+        except Exception:
+            text = Text(content, justify="center")
+    else:
+        text = content
     return Panel(
-        Text(content, justify="center"),
+        text,
         border_style="dim",
         box=ROUNDED,
         padding=(0, 1),
@@ -70,114 +77,131 @@ def render_system_message(content: str) -> Panel:
     )
 
 
-def _progress_callback(event: str, data: Dict[str, Any]) -> None:
+def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["ThinkingIndicator"] = None) -> None:
     """Display progress updates from the agent."""
     if event == "iteration_start":
-        console.print(f"[dim]Iteration {data['iteration']}/{data['max_iterations']}[/dim]")
+        if thinking:
+            thinking.stop()
+        console.print()
+        console.print(f"[bold dim]── Iteration {data['iteration']}/{data['max_iterations']} ──[/bold dim]")
+        if thinking:
+            thinking.start(f"[bold bright_cyan]Thinking (iteration {data['iteration']}/{data['max_iterations']})...[/bold bright_cyan]")
     elif event == "model_response":
-        if data["tool_calls_count"] > 0:
-            console.print(f"[cyan]Model: Planning {data['tool_calls_count']} tool call(s)[/cyan]")
-        elif data["has_content"]:
-            console.print("[cyan]Model: Responding...[/cyan]")
+        if thinking:
+            thinking.stop()
+        if data.get("tool_calls_count", 0) > 0:
+            console.print(f"  [cyan]Model: Planning {data['tool_calls_count']} tool call(s)[/cyan]")
+        elif data.get("has_content"):
+            console.print("  [cyan]Model: Responding...[/cyan]")
     elif event == "tool_start":
+        if thinking:
+            thinking.stop()
         tool = data["tool"]
-        args = data["args"]
+        args = data.get("args", {})
         if tool == "write_file":
-            console.print(f"[green]>[/green] Creating file: {args.get('path', 'unknown')}")
+            console.print(f"  [green]>[/green] Creating file: [bold]{args.get('path', 'unknown')}[/bold]")
         elif tool == "edit_file":
-            console.print(f"[yellow]>[/yellow] Editing file: {args.get('path', 'unknown')}")
+            console.print(f"  [yellow]>[/yellow] Editing file: [bold]{args.get('path', 'unknown')}[/bold]")
         elif tool == "read_file":
-            console.print(f"[blue]>[/blue] Reading file: {args.get('path', 'unknown')}")
+            console.print(f"  [blue]>[/blue] Reading file: [bold]{args.get('path', 'unknown')}[/bold]")
         elif tool == "list_files":
-            console.print(f"[blue]>[/blue] Listing directory: {args.get('path', '.')}")
+            console.print(f"  [blue]>[/blue] Listing directory: [bold]{args.get('path', '.')}[/bold]")
         elif tool == "run_command":
             cmd = args.get('command', 'unknown')
-            console.print(f"[magenta]>[/magenta] Running: {cmd[:60]}...")
+            console.print(f"  [magenta]>[/magenta] Running: [dim]{cmd[:60]}[/dim]...")
         elif tool == "delete_file":
-            console.print(f"[red]>[/red] Deleting: {args.get('path', 'unknown')}")
+            console.print(f"  [red]>[/red] Deleting: [bold]{args.get('path', 'unknown')}[/bold]")
         elif tool == "create_directory":
-            console.print(f"[green]>[/green] Creating directory: {args.get('path', 'unknown')}")
+            console.print(f"  [green]>[/green] Creating directory: [bold]{args.get('path', 'unknown')}[/bold]")
         elif tool == "search_files":
-            console.print(f"[blue]>[/blue] Searching: {args.get('pattern', 'unknown')}")
+            console.print(f"  [blue]>[/blue] Searching: [bold]{args.get('pattern', 'unknown')}[/bold]")
         elif tool == "grep":
-            console.print(f"[blue]>[/blue] Grepping: {args.get('pattern', 'unknown')}")
+            console.print(f"  [blue]>[/blue] Grepping: [bold]{args.get('pattern', 'unknown')}[/bold]")
         else:
-            console.print(f"[dim]>[/dim] {tool}: {args}")
+            console.print(f"  [dim]>[/dim] {tool}: {args}")
     elif event == "tool_complete":
+        if thinking:
+            thinking.stop()
         tool = data["tool"]
-        success = data["success"]
+        success = data.get("success", False)
         metadata = data.get("metadata", {})
         if tool == "write_file":
             action = metadata.get("action", "written")
-            console.print(f"[green]OK[/green] File {action}")
+            console.print(f"  [green]OK[/green] File {action}\n")
         elif tool == "edit_file":
             replacements = data.get("output", {}).get("replacements", 0)
-            console.print(f"[yellow]OK[/yellow] File edited ({replacements} replacement(s))")
+            console.print(f"  [yellow]OK[/yellow] File edited ({replacements} replacement(s))\n")
         elif tool == "read_file":
             output = data.get("output", {})
             lines = output.get("total_lines", 0)
-            console.print(f"[blue]OK[/blue] Read {lines} lines")
+            console.print(f"  [blue]OK[/blue] Read {lines} lines\n")
         elif tool == "list_files":
             count = data.get("metadata", {}).get("count", 0)
-            console.print(f"[blue]OK[/blue] Found {count} items")
+            console.print(f"  [blue]OK[/blue] Found {count} items\n")
         elif tool == "run_command":
             if success:
-                console.print(f"[magenta]OK[/magenta] Command completed")
+                console.print(f"  [magenta]OK[/magenta] Command completed\n")
             else:
-                console.print(f"[red]FAIL[/red] Command failed")
+                console.print(f"  [red]FAIL[/red] Command failed\n")
         elif tool == "delete_file":
             action = metadata.get("action", "deleted")
-            console.print(f"[red]OK[/red] {action}")
+            console.print(f"  [red]OK[/red] {action}\n")
         elif tool == "create_directory":
-            console.print(f"[green]OK[/green] Directory created")
+            console.print(f"  [green]OK[/green] Directory created\n")
         elif tool == "search_files" or tool == "grep":
-            console.print(f"[blue]OK[/blue] Search completed")
+            console.print(f"  [blue]OK[/blue] Search completed\n")
         else:
             if success:
-                console.print(f"[dim]OK[/dim] {tool} completed")
+                console.print(f"  [dim]OK[/dim] {tool} completed\n")
             else:
-                console.print(f"[red]FAIL[/red] {tool} failed: {data.get('error', 'unknown')}")
+                console.print(f"  [red]FAIL[/red] {tool} failed: {data.get('error', 'unknown')}\n")
     elif event == "tool_error":
-        console.print(f"[red]FAIL[/red] {data['tool']} error: {data['error']}")
+        if thinking:
+            thinking.stop()
+        console.print(f"  [red]FAIL[/red] {data['tool']} error: {data.get('error', 'unknown')}\n")
     elif event == "tool_denied":
-        console.print(f"[yellow]DENIED[/yellow] {data['tool']} denied")
+        if thinking:
+            thinking.stop()
+        console.print(f"  [yellow]DENIED[/yellow] {data['tool']} denied\n")
     elif event == "model_error":
-        console.print(f"[red]Model error:[/red] {data['error']}")
+        if thinking:
+            thinking.stop()
+        console.print(f"  [red]Model error:[/red] {data.get('error', 'unknown')}\n")
+
+
+class _AwaitableNone:
+    def __await__(self):
+        async def _noop():
+            return None
+        return _noop().__await__()
 
 
 class ThinkingIndicator:
-    """Animated thinking indicator with beeping dots."""
+    """Status indicator for when the agent/model is thinking."""
+
     def __init__(self, console: Console):
         self.console = console
-        self.running = False
-        self.task = None
+        self._status = None
 
-    async def start(self):
-        self.running = True
-        # Print "thinking" once at the start
-        self.console.print("[bold bright_cyan][bright_white]thinking[/bright_white]", end="")
-        self.console.file.flush()
-        self.task = asyncio.create_task(self._animate())
-
-    async def stop(self):
-        self.running = False
-        if self.task:
-            self.task.cancel()
+    def start(self, message: str = "[bold bright_cyan]Thinking...[/bold bright_cyan]"):
+        """Start the status spinner."""
+        if self._status is None:
             try:
-                await self.task
-            except asyncio.CancelledError:
+                self._status = self.console.status(message, spinner="dots")
+                self._status.start()
+            except Exception:
                 pass
-        # Clear the line
-        self.console.print("\r", end="")
+        return _AwaitableNone()
 
-    async def _animate(self):
-        dots = [".  ", ".. ", "...", " ..", "  .", "   "]
-        i = 0
-        while self.running:
-            self.console.print(f"\r[bold bright_cyan]{dots[i % len(dots)]}[/bold bright_cyan]", end="")
-            self.console.file.flush()
-            await asyncio.sleep(0.1)
-            i += 1
+    def stop(self):
+        """Stop the status spinner."""
+        if self._status is not None:
+            try:
+                self._status.stop()
+            except Exception:
+                pass
+            self._status = None
+        return _AwaitableNone()
 
 
 async def _chat_async(
@@ -186,6 +210,7 @@ async def _chat_async(
     base_url: Optional[str],
     api_key: Optional[str],
     max_iterations: int,
+    auto_approve: bool = False,
 ):
     """Async implementation of chat."""
     reset_config()
@@ -210,13 +235,18 @@ async def _chat_async(
         console.print("[red]Error: API key required. Set OPENAI_API_KEY in .env or use --api-key[/red]")
         raise typer.Exit(1)
 
-    # Welcome banner - IRERI CODE (maximized for visibility)
+    # Welcome banner - IRERI CODE in large font
     console.print()
-    console.print("[bold bright_blue]  #######  ##    ##  #######  ########  ########  [/bold bright_blue]")
-    console.print("[bold bright_blue] ##       ##    ##  ##   ##  ##          ##       [/bold bright_blue]")
-    console.print("[bold bright_blue] ##       ##    ##  ########  ######      ######   [/bold bright_blue]")
-    console.print("[bold bright_blue] ##       ##    ##  ##   ##  ##          ##       [/bold bright_blue]")
-    console.print("[bold bright_blue]  #######  ########  ##   ##  ########  ########  [/bold bright_blue]")
+    banner_lines = [
+        "  ██╗██████╗ ███████╗██████╗ ██╗    ██████╗ ██████╗ ██████╗ ███████╗",
+        "  ██║██╔══██╗██╔════╝██╔══██╗██║   ██╔════╝██╔═══██╗██╔══██╗██╔════╝",
+        "  ██║██████╔╝█████╗  ██████╔╝██║   ██║     ██║   ██║██║  ██║█████╗  ",
+        "  ██║██╔══██╗██╔══╝  ██╔══██╗██║   ██║     ██║   ██║██║  ██║██╔══╝  ",
+        "  ██║██║  ██║███████╗██║  ██║██║   ╚██████╗╚██████╔╝██████╔╝███████╗",
+        "  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝    ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝",
+    ]
+    for line in banner_lines:
+        console.print(f"[bold bright_cyan]{line}[/bold bright_cyan]")
     console.print()
     console.print("[bold bright_green]  Terminal AI Coding Agent  v0.1.0[/bold bright_green]")
     console.print()
@@ -229,12 +259,18 @@ async def _chat_async(
 
     # Initialize controller
     controller = AgentController()
+    if auto_approve:
+        controller.set_approve_all(True)
+
+    thinking = ThinkingIndicator(console)
 
     # Define approval callback for interactive mode
     async def _approval_callback(tool_name: str, args: Dict[str, Any], dangerous: bool) -> bool:
         """Prompt user for tool approval."""
+        thinking.stop()
         import asyncio
         from rich.prompt import Prompt
+        from rich.markup import escape
 
         # Format args for display
         args_display = ", ".join(f"{k}={v}" for k, v in args.items())
@@ -244,15 +280,21 @@ async def _chat_async(
         # Build prompt message
         danger_indicator = " [red]! DANGEROUS[/red]" if dangerous else ""
         console.print()
-        console.print(render_system_message(f"[yellow]Approval required:[/yellow] {tool_name}({args_display}){danger_indicator}"))
+        console.print(render_system_message(f"[yellow]Approval required:[/yellow] {escape(tool_name)}({escape(args_display)}){danger_indicator}"))
         console.print(render_system_message("[dim]Options: [bold]y[/bold]=approve  [bold]n[/bold]=deny  [bold]a[/bold]=approve all  [bold]d[/bold]=deny all[/dim]"))
 
         # Run blocking Prompt.ask in executor to avoid blocking event loop
         loop = asyncio.get_event_loop()
         choice = await loop.run_in_executor(
             None,
-            lambda: Prompt.ask("[bold cyan]Approve?[/bold cyan]", choices=["y", "n", "a", "d"], default="y")
+            lambda: Prompt.ask(
+                "[bold cyan]Approve?[/bold cyan]",
+                choices=["y", "n", "a", "d"],
+                default="y",
+                case_sensitive=False,
+            )
         )
+        choice = str(choice).strip().lower()
 
         if choice == "a":
             controller.set_approve_all(True)
@@ -269,20 +311,27 @@ async def _chat_async(
 
     controller.approval_callback = _approval_callback
 
-    # Set up readline completion
-    setup_readline_completion()
+    # Initialize prompt_toolkit session with auto-completion and dynamic prompt
+    from prompt_toolkit import PromptSession
+    pt_session = PromptSession(erase_when_done=True)
+    pt_completer = SlashCommandCompleter()
 
-    # Chat loop - use readline for tab completion
+    # Chat loop
     async def _chat_loop():
         while True:
             try:
                 console.print()
-                # Get user input using readline for tab completion
-                loop = asyncio.get_event_loop()
-                user_input = await loop.run_in_executor(
-                    None,
-                    lambda: _get_input_with_readline()
-                )
+                # Get user input with prompt_toolkit, falling back to readline/input
+                try:
+                    user_input = await pt_session.prompt_async(_get_dynamic_prompt, completer=pt_completer)
+                except (EOFError, KeyboardInterrupt):
+                    raise
+                except Exception:
+                    loop = asyncio.get_event_loop()
+                    user_input = await loop.run_in_executor(
+                        None,
+                        lambda: _get_input_with_readline()
+                    )
 
                 if user_input.lower() in ("exit", "quit", "q"):
                     console.print()
@@ -332,13 +381,14 @@ async def _chat_async(
                     console.print(render_agent_message(response))
                     continue
 
-                # Run task with thinking animation
-                thinking = ThinkingIndicator(console)
-                await thinking.start()
+                # Run task with progress and thinking animation
                 try:
-                    result = await controller.run_task(user_input, progress_callback=_progress_callback)
+                    result = await controller.run_task(
+                        user_input,
+                        progress_callback=lambda event, data: _progress_callback(event, data, thinking),
+                    )
                 finally:
-                    await thinking.stop()
+                    thinking.stop()
 
                 # Display result on the left
                 console.print(render_agent_message(result))
@@ -377,6 +427,33 @@ SLASH_COMMANDS = {
 # Extract just command names for completion
 SLASH_COMMAND_NAMES = list(SLASH_COMMANDS.keys())
 
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.formatted_text import HTML
+
+
+class SlashCommandCompleter(Completer):
+    """Auto-completion for slash commands in prompt_toolkit."""
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if text.startswith("/"):
+            for cmd, desc in SLASH_COMMANDS.items():
+                if cmd.startswith(text):
+                    yield Completion(cmd, start_position=-len(text), display_meta=desc)
+
+
+def _get_dynamic_prompt():
+    """Show clean prompt when idle, and 'You: ' dynamically once the user begins typing."""
+    from prompt_toolkit.application.current import get_app
+    try:
+        app = get_app()
+        if app and app.current_buffer and app.current_buffer.text:
+            return HTML("<ansicyan><b>You: </b></ansicyan>")
+    except Exception:
+        pass
+    return HTML("<ansicyan><b>❯ </b></ansicyan>")
+
+
 def setup_readline_completion():
     """Set up readline for tab completion of slash commands."""
     # Only works on Unix-like systems and Windows with pyreadline3
@@ -400,7 +477,7 @@ def setup_readline_completion():
 
 
 def _get_input_with_readline() -> str:
-    """Get user input with readline tab completion support."""
+    """Get user input with readline tab completion support (fallback)."""
     try:
         import readline
         # Set up completion each time (in case it wasn't set up)
@@ -417,7 +494,7 @@ def _get_input_with_readline() -> str:
         readline.parse_and_bind('"?": complete')
     except ImportError:
         pass
-    return input("\x1b[1;36mYou\x1b[0m ")
+    return input("\x1b[1;36m❯\x1b[0m ")
 
 
 async def _handle_slash_command(command: str, controller: AgentController) -> None:
@@ -623,6 +700,9 @@ def chat(
     max_iterations: int = typer.Option(
         20, "--max-iterations", "-i", help="Maximum iterations"
     ),
+    auto_approve: bool = typer.Option(
+        False, "--yes", "-y", "--auto-approve", help="Auto-approve all tool calls"
+    ),
 ):
     """Start an interactive chat session with ireri."""
     import asyncio
@@ -633,7 +713,7 @@ def chat(
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(_chat_async(project, model, base_url, api_key, max_iterations))
+        loop.run_until_complete(_chat_async(project, model, base_url, api_key, max_iterations, auto_approve))
     finally:
         # Don't close if we didn't create it
         if not loop.is_closed() and loop != asyncio.get_event_loop():
