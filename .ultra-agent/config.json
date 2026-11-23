@@ -1,0 +1,10 @@
+{
+  "openai_api_key": "sk-test-key-123",
+  "openai_base_url": "https://api.openai.com/v1",
+  "openai_model": "gpt-4o",
+  "max_iterations": 20,
+  "max_tool_calls": 50,
+  "command_timeout": 60,
+  "workspace_root": "C:\\antigravity\\codingagent",
+  "log_level": "INFO"
+}
