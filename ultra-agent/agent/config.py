@@ -38,7 +38,7 @@ class AgentConfig(BaseSettings):
 
     # Agent Behavior
     max_iterations: int = Field(
-        default=20,
+        default=50,
         description="Maximum agent loop iterations per task"
     )
     max_tool_calls: int = Field(
@@ -196,7 +196,7 @@ def _load_dotenv_file() -> dict:
             if line and not line.startswith("#") and "=" in line:
                 key, value = line.split("=", 1)
                 result[key.strip()] = value.strip()
-    return {}
+    return result
 
 
 def get_config() -> AgentConfig:

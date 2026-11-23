@@ -77,6 +77,9 @@ class AgentController:
         if progress_callback:
             self.progress_callback = progress_callback
 
+        # Reset iteration count for each message generation
+        self.context.reset_iteration_count()
+
         # Add task to context
         prompt = get_task_prompt(task, project_context)
         self.context.add_user_message(prompt)
@@ -86,6 +89,7 @@ class AgentController:
             return result
         finally:
             self.running = False
+            self.context.reset_iteration_count()
 
     async def _agent_loop(self) -> str:
         """Main agent loop."""

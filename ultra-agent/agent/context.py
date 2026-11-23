@@ -119,6 +119,10 @@ class ContextManager:
         self.iteration_count += 1
         return self.iteration_count
 
+    def reset_iteration_count(self) -> None:
+        """Reset iteration count for a new task/message generation."""
+        self.iteration_count = 0
+
     def get_iteration_count(self) -> int:
         """Get current iteration count."""
         return self.iteration_count

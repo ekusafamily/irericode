@@ -82,10 +82,7 @@ def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["Thi
     if event == "iteration_start":
         if thinking:
             thinking.stop()
-        console.print()
-        console.print(f"[bold dim]── Iteration {data['iteration']}/{data['max_iterations']} ──[/bold dim]")
-        if thinking:
-            thinking.start(f"[bold bright_cyan]Thinking (iteration {data['iteration']}/{data['max_iterations']})...[/bold bright_cyan]")
+            thinking.start("[bold bright_cyan]Thinking...[/bold bright_cyan]")
     elif event == "model_response":
         if thinking:
             thinking.stop()
@@ -313,8 +310,14 @@ async def _chat_async(
 
     # Initialize prompt_toolkit session with auto-completion and dynamic prompt
     from prompt_toolkit import PromptSession
-    pt_session = PromptSession(erase_when_done=True)
+    from prompt_toolkit.shortcuts import CompleteStyle
     pt_completer = SlashCommandCompleter()
+    pt_session = PromptSession(
+        erase_when_done=True,
+        completer=pt_completer,
+        complete_while_typing=True,
+        complete_style=CompleteStyle.COLUMN,
+    )
 
     # Chat loop
     async def _chat_loop():
@@ -323,7 +326,12 @@ async def _chat_async(
                 console.print()
                 # Get user input with prompt_toolkit, falling back to readline/input
                 try:
-                    user_input = await pt_session.prompt_async(_get_dynamic_prompt, completer=pt_completer)
+                    user_input = await pt_session.prompt_async(
+                        _get_dynamic_prompt,
+                        completer=pt_completer,
+                        complete_while_typing=True,
+                        complete_style=CompleteStyle.COLUMN,
+                    )
                 except (EOFError, KeyboardInterrupt):
                     raise
                 except Exception:
@@ -346,7 +354,9 @@ async def _chat_async(
 
                 # Handle slash commands
                 if user_input.strip().startswith("/"):
-                    await _handle_slash_command(user_input.strip(), controller)
+                    should_continue = await _handle_slash_command(user_input.strip(), controller)
+                    if should_continue is False:
+                        break
                     continue
 
                 # Handle conversational messages directly
@@ -393,6 +403,8 @@ async def _chat_async(
                 # Display result on the left
                 console.print(render_agent_message(result))
 
+            except (typer.Exit, SystemExit):
+                break
             except KeyboardInterrupt:
                 console.print()
                 console.print(render_system_message("[yellow]Interrupted[/yellow]"))
@@ -410,18 +422,18 @@ async def _chat_async(
 # Available slash commands for auto-completion
 SLASH_COMMANDS = {
     "/help": "Display all available commands",
-    "/settings": "Open interactive settings",
+    "/provider": "Configure AI providers (NVIDIA, OpenAI, etc.)",
+    "/settings": "Open interactive settings & API profiles",
     "/model": "View or switch AI models",
     "/models": "List available models",
-    "/provider": "Configure AI providers",
     "/status": "Show current agent status",
     "/config": "View or edit configuration",
-    "/exit": "Exit the agent",
     "/clear": "Clear terminal conversation",
     "/reset": "Reset current session",
     "/version": "Show agent version",
     "/update": "Check for and install updates",
     "/about": "Information about the agent",
+    "/exit": "Exit the agent",
 }
 
 # Extract just command names for completion
@@ -508,124 +520,208 @@ async def _handle_slash_command(command: str, controller: AgentController) -> No
 
     if cmd == "/help":
         _show_help()
-        return
+        return True
 
     elif cmd == "/model":
         config = get_config()
         await _show_models_command(config)
-        return
+        return True
 
     elif cmd == "/models":
         config = get_config()
         await _show_models_list(config)
-        return
+        return True
 
-    elif cmd == "/settings":
-        await _handle_settings_command(parts, controller)
-        return
-
-    elif cmd == "/provider":
-        _show_provider_command()
-        return
+    elif cmd in ("/settings", "/provider"):
+        await _handle_provider_command(parts, controller)
+        return True
 
     elif cmd == "/status":
         _show_status_command(controller)
-        return
+        return True
 
     elif cmd == "/config":
         _show_config_command()
-        return
+        return True
 
-    elif cmd == "/exit":
+    elif cmd in ("/exit", "/quit", "/q"):
         console.print(render_system_message("[yellow]Goodbye from ireri![/yellow]"))
-        raise typer.Exit(0)
+        return False
 
     elif cmd == "/clear":
         console.clear()
-        return
+        return True
 
     elif cmd == "/reset":
         controller.reset()
         console.print(render_system_message("[green]Session reset.[/green]"))
-        return
+        return True
 
     elif cmd == "/version":
         _show_version_command()
-        return
+        return True
 
     elif cmd == "/update":
         _show_update_command()
-        return
+        return True
 
     elif cmd == "/about":
         _show_about_command()
-        return
+        return True
 
     else:
         console.print(f"[yellow]Unknown command: {cmd}. Type /help for available commands.[/yellow]")
+        return True
 
 
-async def _handle_settings_command(parts: list, controller: AgentController) -> None:
-    """Handle /settings slash command for managing API key profiles."""
+async def _handle_provider_command(parts: list, controller: AgentController) -> None:
+    """Handle /provider and /settings slash commands for configuring AI providers."""
     from agent.config import get_config, get_profiles, save_profile, delete_profile, load_profile
     from agent.model import reset_model_client, get_model_client
 
-    subcommand = parts[1].lower() if len(parts) > 1 else "list"
+    subcommand = parts[1].lower() if len(parts) > 1 else ""
 
-    if subcommand == "list":
-        profiles = get_profiles()
+    if not subcommand or subcommand == "list":
         config = get_config()
+        profiles = get_profiles()
 
-        if not profiles:
-            console.print("[yellow]No profiles saved. Use '/settings add <name>' to add one.[/yellow]")
+        # Header panel with instructions & NVIDIA recommendation
+        info_text = (
+            f"[bold bright_green]Active Model:[/bold bright_green] [cyan]{config.openai_model}[/cyan]\n"
+            f"[bold bright_green]Active Base URL:[/bold bright_green] [dim]{config.openai_base_url}[/dim]\n"
+            f"[bold bright_green]API Key:[/bold bright_green] [dim]{('***' + config.openai_api_key[-4:]) if config.openai_api_key else 'Not set'}[/dim]\n\n"
+            "[bold bright_yellow]★ RECOMMENDED: NVIDIA NIM Free Models ★[/bold bright_yellow]\n"
+            "NVIDIA provides 1,000 free API credits with access to top-tier open models.\n"
+            "• [bold]Register for free key:[/bold] [underline cyan]https://build.nvidia.com/[/underline cyan]\n"
+            "• [bold]Base URL:[/bold] [cyan]https://integrate.api.nvidia.com/v1[/cyan]\n"
+            "• [bold]Top Models:[/bold] [green]nvidia/nemotron-3.5-bolt-e4b[/green], [green]meta/llama-3.3-70b-instruct[/green], [green]deepseek-ai/deepseek-r1[/green]\n\n"
+            "[bold]Quick Commands:[/bold]\n"
+            "• [cyan]/provider nvidia[/cyan]      -> Fast 1-step setup for NVIDIA NIM\n"
+            "• [cyan]/provider add[/cyan]         -> Guided wizard to add any provider (NVIDIA, OpenAI, Groq...)\n"
+            "• [cyan]/provider use <name>[/cyan] -> Switch active provider profile\n"
+            "• [cyan]/provider list[/cyan]        -> List all saved profiles"
+        )
+        console.print()
+        console.print(Panel(
+            Text.from_markup(info_text),
+            title="[bold bright_blue]AI Provider & API Settings[/bold bright_blue]",
+            border_style="bright_blue",
+            box=ROUNDED,
+            padding=(1, 2),
+        ))
+
+        if profiles:
+            table = Table(title="Saved Profiles", box=ROUNDED, border_style="dim")
+            table.add_column("Name", style="cyan")
+            table.add_column("Base URL", style="white")
+            table.add_column("Model", style="dim")
+            table.add_column("Status", style="green")
+
+            for name, profile in profiles.items():
+                is_active = (profile.get("api_key") == config.openai_api_key and
+                             profile.get("base_url") == config.openai_base_url)
+                table.add_row(
+                    name,
+                    profile.get("base_url", ""),
+                    profile.get("model", "default"),
+                    "[bold green]Active[/bold green]" if is_active else ""
+                )
+            console.print()
+            console.print(table)
+        console.print()
+        return
+
+    elif subcommand == "nvidia":
+        console.print()
+        console.print(Panel(
+            "[bold bright_cyan]NVIDIA NIM Provider Setup[/bold bright_cyan]\n"
+            "NVIDIA provides 1,000 free API credits on registration!\n"
+            "Register & get your free key at: [bold underline cyan]https://build.nvidia.com/[/bold underline cyan]",
+            title="[bold green]NVIDIA Free Tier[/bold green]",
+            border_style="green",
+            box=ROUNDED,
+        ))
+
+        api_key = Prompt.ask("[bold cyan]Enter NVIDIA API Key (nvapi-...)[/bold cyan]").strip()
+        if not api_key:
+            console.print("[yellow]Setup cancelled: API key required.[/yellow]")
             return
 
-        table = Table(title="API Key Profiles")
-        table.add_column("Name", style="cyan")
-        table.add_column("Base URL", style="white")
-        table.add_column("Model", style="dim")
-        table.add_column("Active", style="green")
+        base_url = "https://integrate.api.nvidia.com/v1"
+        console.print("\n[dim]Recommended models: nvidia/nemotron-3.5-bolt-e4b, meta/llama-3.3-70b-instruct, deepseek-ai/deepseek-r1[/dim]")
+        model = Prompt.ask("[bold cyan]Default Model[/bold cyan]", default="nvidia/nemotron-3.5-bolt-e4b").strip()
 
-        for name, profile in profiles.items():
-            is_active = (profile["api_key"] == config.openai_api_key and
-                         profile["base_url"] == config.openai_base_url)
-            table.add_row(
-                name,
-                profile["base_url"],
-                profile.get("model", "default"),
-                "[green]*[/green]" if is_active else ""
-            )
-
-        console.print(table)
+        save_profile("nvidia", api_key, base_url, model)
+        load_profile("nvidia")
+        reset_model_client()
+        controller.model_client = get_model_client()
+        console.print(render_system_message(f"[green]NVIDIA provider configured and activated with model '{model}'![/green]"))
+        return
 
     elif subcommand == "add":
-        if len(parts) < 3:
-            console.print("[red]Usage: /settings add <name>[/red]")
+        name = parts[2] if len(parts) > 2 else ""
+
+        if not name:
+            console.print()
+            console.print("[bold cyan]Select provider template:[/bold cyan]")
+            console.print("  [bold]1[/bold]) NVIDIA NIM ([green]Recommended Free Tier[/green] - https://build.nvidia.com/)")
+            console.print("  [bold]2[/bold]) OpenAI (https://api.openai.com/v1)")
+            console.print("  [bold]3[/bold]) OpenRouter (https://openrouter.ai/api/v1)")
+            console.print("  [bold]4[/bold]) Groq (https://api.groq.com/openai/v1)")
+            console.print("  [bold]5[/bold]) Custom OpenAI-compatible URL")
+            choice = Prompt.ask("[bold cyan]Choice[/bold cyan]", choices=["1", "2", "3", "4", "5"], default="1")
+
+            if choice == "1":
+                name = "nvidia"
+                default_url = "https://integrate.api.nvidia.com/v1"
+                default_model = "nvidia/nemotron-3.5-bolt-e4b"
+                console.print("[dim]Register for free key: https://build.nvidia.com/[/dim]")
+            elif choice == "2":
+                name = "openai"
+                default_url = "https://api.openai.com/v1"
+                default_model = "gpt-4o-mini"
+            elif choice == "3":
+                name = "openrouter"
+                default_url = "https://openrouter.ai/api/v1"
+                default_model = "meta-llama/llama-3.3-70b-instruct"
+            elif choice == "4":
+                name = "groq"
+                default_url = "https://api.groq.com/openai/v1"
+                default_model = "llama-3.3-70b-versatile"
+            else:
+                name = Prompt.ask("[bold cyan]Profile Name[/bold cyan]", default="custom").strip()
+                default_url = "https://api.openai.com/v1"
+                default_model = "gpt-4o-mini"
+        else:
+            if name.lower() == "nvidia":
+                default_url = "https://integrate.api.nvidia.com/v1"
+                default_model = "nvidia/nemotron-3.5-bolt-e4b"
+                console.print("[dim]Register for free key: https://build.nvidia.com/[/dim]")
+            else:
+                default_url = "https://api.openai.com/v1"
+                default_model = "gpt-4o-mini"
+
+        base_url = Prompt.ask("[bold cyan]Base URL[/bold cyan]", default=default_url).strip()
+        api_key = Prompt.ask("[bold cyan]API Key[/bold cyan]").strip()
+        if not api_key:
+            console.print("[yellow]API key cannot be empty.[/yellow]")
             return
 
-        name = parts[2]
-        profiles = get_profiles()
-
-        if name in profiles:
-            console.print(f"[yellow]Profile '{name}' already exists. Use '/settings delete {name}' first.[/yellow]")
-            return
-
-        api_key = Prompt.ask("[bold cyan]API Key[/bold cyan]")
-        base_url = Prompt.ask("[bold cyan]Base URL[/bold cyan]", default="https://api.openai.com/v1")
-        model = Prompt.ask("[bold cyan]Model (optional)[/bold cyan]", default="")
+        model = Prompt.ask("[bold cyan]Default Model[/bold cyan]", default=default_model).strip()
 
         save_profile(name, api_key, base_url, model)
         console.print(f"[green]Profile '{name}' saved.[/green]")
 
-        if Confirm.ask("Set as active profile?", default=True):
+        if Confirm.ask(f"Set '{name}' as active profile?", default=True):
             load_profile(name)
             reset_model_client()
             controller.model_client = get_model_client()
-            console.print(f"[green]Active profile set to '{name}'.[/green]")
+            console.print(render_system_message(f"[green]Active profile set to '{name}'.[/green]"))
+        return
 
     elif subcommand == "delete":
         if len(parts) < 3:
-            console.print("[red]Usage: /settings delete <name>[/red]")
+            console.print("[red]Usage: /provider delete <name>[/red]")
             return
 
         name = parts[2]
@@ -633,23 +729,25 @@ async def _handle_settings_command(parts: list, controller: AgentController) -> 
             console.print(f"[green]Profile '{name}' deleted.[/green]")
         else:
             console.print(f"[red]Profile '{name}' not found.[/red]")
+        return
 
     elif subcommand == "use":
         if len(parts) < 3:
-            console.print("[red]Usage: /settings use <name>[/red]")
+            console.print("[red]Usage: /provider use <name>[/red]")
             return
 
         name = parts[2]
         if load_profile(name):
             reset_model_client()
             controller.model_client = get_model_client()
-            console.print(f"[green]Active profile set to '{name}'.[/green]")
+            console.print(render_system_message(f"[green]Active profile set to '{name}'.[/green]"))
         else:
             console.print(f"[red]Profile '{name}' not found.[/red]")
+        return
 
     elif subcommand == "show":
         config = get_config()
-        table = Table(title="Current Settings")
+        table = Table(title="Current Settings", box=ROUNDED, border_style="bright_blue")
         table.add_column("Setting", style="cyan")
         table.add_column("Value", style="white")
 
@@ -660,11 +758,22 @@ async def _handle_settings_command(parts: list, controller: AgentController) -> 
         table.add_row("Max Tool Calls", str(config.max_tool_calls))
         table.add_row("Command Timeout", f"{config.command_timeout}s")
         table.add_row("Log Level", config.log_level)
-
+        console.print()
         console.print(table)
+        console.print()
+        return
 
     else:
-        console.print("[yellow]Unknown subcommand. Use: list, add, delete, use, show[/yellow]")
+        # Check if subcommand is a profile name to use directly
+        profiles = get_profiles()
+        if subcommand in profiles:
+            load_profile(subcommand)
+            reset_model_client()
+            controller.model_client = get_model_client()
+            console.print(render_system_message(f"[green]Active profile set to '{subcommand}'.[/green]"))
+            return
+
+        console.print(f"[yellow]Unknown command option: {subcommand}. Use /provider for help.[/yellow]")
 
 
 async def _fetch_models(base_url: str, api_key: str) -> list:
@@ -698,7 +807,7 @@ def chat(
         None, "--api-key", "-k", help="API key"
     ),
     max_iterations: int = typer.Option(
-        20, "--max-iterations", "-i", help="Maximum iterations"
+        50, "--max-iterations", "-i", help="Maximum iterations"
     ),
     auto_approve: bool = typer.Option(
         False, "--yes", "-y", "--auto-approve", help="Auto-approve all tool calls"
@@ -736,7 +845,7 @@ def run(
         None, "--api-key", "-k", help="API key"
     ),
     max_iterations: int = typer.Option(
-        20, "--max-iterations", "-i", help="Maximum iterations"
+        50, "--max-iterations", "-i", help="Maximum iterations"
     ),
     json_output: bool = typer.Option(
         False, "--json", "-j", help="Output result as JSON"
@@ -992,13 +1101,32 @@ def _show_help() -> None:
 
 def _show_provider_command() -> None:
     """Handle /provider command - configure AI providers."""
+    from agent.config import get_config
+    config = get_config()
+    info_text = (
+        f"[bold bright_green]Active Model:[/bold bright_green] [cyan]{config.openai_model}[/cyan]\n"
+        f"[bold bright_green]Active Base URL:[/bold bright_green] [dim]{config.openai_base_url}[/dim]\n"
+        f"[bold bright_green]API Key:[/bold bright_green] [dim]{('***' + config.openai_api_key[-4:]) if config.openai_api_key else 'Not set'}[/dim]\n\n"
+        "[bold bright_yellow]★ RECOMMENDED: NVIDIA NIM Free Models ★[/bold bright_yellow]\n"
+        "NVIDIA provides 1,000 free API credits with access to top-tier open models.\n"
+        "• [bold]Register for free key:[/bold] [underline cyan]https://build.nvidia.com/[/underline cyan]\n"
+        "• [bold]Base URL:[/bold] [cyan]https://integrate.api.nvidia.com/v1[/cyan]\n"
+        "• [bold]Top Models:[/bold] [green]nvidia/nemotron-3.5-bolt-e4b[/green], [green]meta/llama-3.3-70b-instruct[/green], [green]deepseek-ai/deepseek-r1[/green]\n\n"
+        "[bold]Quick Commands:[/bold]\n"
+        "• [cyan]/provider nvidia[/cyan]      -> Fast 1-step setup for NVIDIA NIM\n"
+        "• [cyan]/provider add[/cyan]         -> Guided wizard to add any provider\n"
+        "• [cyan]/provider use <name>[/cyan] -> Switch active provider profile\n"
+        "• [cyan]/provider list[/cyan]        -> List all saved profiles"
+    )
+    console.print()
     console.print(Panel(
-        "[dim]Provider configuration coming soon.[/dim]\n"
-        "Currently supports OpenAI-compatible endpoints.\n"
-        "Use /settings to manage API key profiles.",
-        title="[bold]AI Provider Settings[/bold]",
+        Text.from_markup(info_text),
+        title="[bold bright_blue]AI Provider & API Settings[/bold bright_blue]",
         border_style="bright_blue",
+        box=ROUNDED,
+        padding=(1, 2),
     ))
+    console.print()
 
 
 def _show_status_command(controller: AgentController) -> None:
