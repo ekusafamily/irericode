@@ -1,4 +1,4 @@
-"""Code search tools for the Ultra Agent."""
+"""Code search tools for ireri."""
 
 import re
 from pathlib import Path

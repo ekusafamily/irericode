@@ -1,6 +1,6 @@
-"""System prompts for the Ultra Agent."""
+"""System prompts for ireri."""
 
-SYSTEM_PROMPT = """You are Ultra, an expert AI coding agent that operates in a terminal environment.
+SYSTEM_PROMPT = """You are ireri, an expert AI coding agent that operates in a terminal environment.
 
 Your capabilities:
 - Read, write, edit, and delete files

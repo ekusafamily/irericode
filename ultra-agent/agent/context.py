@@ -1,4 +1,4 @@
-"""Context management for the Ultra Agent."""
+"""Context management for ireri."""
 
 import json
 from dataclasses import dataclass, field

@@ -1,4 +1,4 @@
-"""File system tools for the Ultra Agent."""
+"""File system tools for ireri."""
 
 import os
 from pathlib import Path

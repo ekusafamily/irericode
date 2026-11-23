@@ -1,4 +1,4 @@
-"""Terminal/command execution tools for the Ultra Agent."""
+"""Terminal/command execution tools for ireri."""
 
 import asyncio
 import shlex
@@ -92,6 +92,7 @@ class RunCommandTool(Tool):
     description = "Execute a shell command in the workspace"
     args_schema = RunCommandArgs
     requires_approval = True
+    dangerous = True
 
     async def execute(self, args: RunCommandArgs) -> ToolResult:
         try:

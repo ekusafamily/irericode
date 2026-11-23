@@ -1,4 +1,4 @@
-"""Ultra Agent - A terminal-based AI coding agent."""
+"""ireri - A terminal-based AI coding agent."""
 
 from agent.config import AgentConfig, get_config, set_config
 from agent.model import ModelClient, get_model_client, set_model_client

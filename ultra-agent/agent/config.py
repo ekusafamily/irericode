@@ -1,4 +1,4 @@
-"""Configuration management for the Ultra Agent."""
+"""Configuration management for ireri."""
 
 import json
 import os
@@ -9,7 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 # Global config directory
-CONFIG_DIR = Path.home() / ".ultra-agent"
+CONFIG_DIR = Path.home() / ".ireri-code"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 MODELS_CACHE_FILE = CONFIG_DIR / "models.json"
 PROFILES_FILE = CONFIG_DIR / "profiles.json"

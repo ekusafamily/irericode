@@ -1,4 +1,4 @@
-"""Model client for the Ultra Agent."""
+"""Model client for ireri."""
 
 import os
 import logging

@@ -1,2 +1,2 @@
 # Simple hello world Python file
-print("Hello from Ultra Agent!")
+print("Hello from ireri!")

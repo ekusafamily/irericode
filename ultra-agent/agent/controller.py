@@ -1,10 +1,10 @@
-"""Main agent controller for the Ultra Agent."""
+"""Main agent controller for ireri."""
 
 import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.config import get_config
 from agent.model import get_model_client, ModelClient, ModelResponse
@@ -13,6 +13,12 @@ from agent.prompts import get_system_prompt, get_task_prompt, get_continuation_p
 from agent.tools import get_registry, ToolRegistry, ToolResult
 
 logger = logging.getLogger(__name__)
+
+# Progress callback type
+ProgressCallback = Callable[[str, Dict[str, Any]], None]
+
+# Approval callback type
+ApprovalCallback = Callable[[str, Dict[str, Any], bool], bool]
 
 
 class AgentController:
@@ -24,6 +30,8 @@ class AgentController:
         tool_registry: Optional[ToolRegistry] = None,
         context: Optional[ContextManager] = None,
         model: Optional[str] = None,
+        progress_callback: Optional[ProgressCallback] = None,
+        approval_callback: Optional[ApprovalCallback] = None,
     ):
         from agent.config import reset_config
         from agent.model import reset_model_client, ModelClient
@@ -37,6 +45,8 @@ class AgentController:
         self.model_client = model_client or ModelClient(model=effective_model)
         self.tool_registry = tool_registry or get_registry()
         self.context = context or ContextManager()
+        self.progress_callback = progress_callback
+        self.approval_callback = approval_callback
 
         # Add system prompt
         self.context.add_system_message(get_system_prompt())
@@ -46,10 +56,26 @@ class AgentController:
         self.cancelled = False
         self.last_error: Optional[str] = None
 
-    async def run_task(self, task: str, project_context: str = "") -> str:
+        # Approval state
+        self._approve_all = False
+        self._deny_all = False
+
+    def reset(self) -> None:
+        """Reset the controller state for a new session."""
+        self.context.clear()
+        self.context.add_system_message(get_system_prompt())
+        self.running = False
+        self.cancelled = False
+        self.last_error = None
+        self._approve_all = False
+        self._deny_all = False
+
+    async def run_task(self, task: str, project_context: str = "", progress_callback: Optional[ProgressCallback] = None) -> str:
         """Run a complete task and return the result."""
         self.running = True
         self.cancelled = False
+        if progress_callback:
+            self.progress_callback = progress_callback
 
         # Add task to context
         prompt = get_task_prompt(task, project_context)
@@ -79,6 +105,13 @@ class AgentController:
             iteration = self.context.increment_iteration()
             logger.info(f"Agent iteration {iteration}/{max_iterations}")
 
+            # Emit progress: iteration started
+            if self.progress_callback:
+                self.progress_callback("iteration_start", {
+                    "iteration": iteration,
+                    "max_iterations": max_iterations,
+                })
+
             # Get messages for model
             messages = self.context.get_messages_for_model()
 
@@ -96,12 +129,22 @@ class AgentController:
             except Exception as e:
                 logger.error(f"Model call failed: {e}")
                 self.last_error = str(e)
+                if self.progress_callback:
+                    self.progress_callback("model_error", {"error": str(e)})
                 # Try to recover
                 error_prompt = get_error_recovery_prompt(str(e))
                 self.context.add_user_message(error_prompt)
                 continue
 
             logger.info(f"Model response: content={response.content[:100] if response.content else None}, tool_calls={len(response.tool_calls) if response.tool_calls else 0}")
+
+            # Emit progress: model response
+            if self.progress_callback:
+                self.progress_callback("model_response", {
+                    "has_content": bool(response.content),
+                    "tool_calls_count": len(response.tool_calls) if response.tool_calls else 0,
+                    "finish_reason": response.finish_reason,
+                })
 
             # Handle response
             if response.tool_calls:
@@ -175,10 +218,19 @@ class AgentController:
                 error=f"Invalid tool arguments: {e}"
             )
 
+        # Emit progress: tool started
+        if self.progress_callback:
+            self.progress_callback("tool_start", {
+                "tool": tool_name,
+                "args": args_dict,
+            })
+
         # Check approval
         if tool.requires_approval:
-            approved = await self._request_approval(tool_name, args_dict)
+            approved = await self._request_approval(tool_name, args_dict, tool.dangerous)
             if not approved:
+                if self.progress_callback:
+                    self.progress_callback("tool_denied", {"tool": tool_name})
                 return ToolResult(
                     success=False,
                     error="User denied approval"
@@ -189,17 +241,50 @@ class AgentController:
         try:
             result = await tool.execute(args)
             logger.info(f"Tool {tool_name} result: success={result.success}")
+
+            # Emit progress: tool completed
+            if self.progress_callback:
+                self.progress_callback("tool_complete", {
+                    "tool": tool_name,
+                    "success": result.success,
+                    "output": result.output,
+                    "error": result.error,
+                    "metadata": result.metadata,
+                })
+
             return result
         except Exception as e:
             logger.error(f"Tool {tool_name} execution error: {e}")
+            if self.progress_callback:
+                self.progress_callback("tool_error", {
+                    "tool": tool_name,
+                    "error": str(e),
+                })
             return ToolResult(success=False, error=str(e))
 
-    async def _request_approval(self, tool_name: str, args: Dict[str, Any]) -> bool:
+    async def _request_approval(self, tool_name: str, args: Dict[str, Any], dangerous: bool = False) -> bool:
         """Request user approval for a tool call."""
-        # For now, auto-approve in non-interactive mode
-        # In interactive mode, this would prompt the user
+        # Check session-level approvals first
+        if self._approve_all:
+            return True
+        if self._deny_all:
+            return False
+
+        # If we have an approval callback, use it
+        if self.approval_callback:
+            return await self.approval_callback(tool_name, args, dangerous)
+
+        # Fallback: auto-approve in non-interactive mode
         logger.info(f"Approval requested for {tool_name}: {args}")
         return True  # Auto-approve for now
+
+    def set_approve_all(self, value: bool) -> None:
+        """Set approve-all mode for the session."""
+        self._approve_all = value
+
+    def set_deny_all(self, value: bool) -> None:
+        """Set deny-all mode for the session."""
+        self._deny_all = value
 
     def _is_task_complete(self, response: str) -> bool:
         """Heuristic to detect if task is complete."""
