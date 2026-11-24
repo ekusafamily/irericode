@@ -62,6 +62,8 @@ class AgentController:
         self.running = False
         self.cancelled = False
         self.last_error: Optional[str] = None
+        self.message_queue: List[str] = []
+        self.active_approval: Optional[asyncio.Future] = None
 
         # Approval state
         self._approve_all = False
@@ -104,6 +106,8 @@ class AgentController:
         self.context.clear()
         self.context.add_system_message(get_system_prompt())
         self.clear_saved_session()
+        self.clear_message_queue()
+        self.active_approval = None
         self.running = False
         self.cancelled = False
         self.last_error = None
@@ -404,6 +408,78 @@ class AgentController:
         # Exact match or very short message
         return msg in conversational_patterns or (len(msg) < 30 and msg in ["hi", "hello", "hey", "thanks", "bye", "ok"])
 
+    def queue_message(self, message: str) -> int:
+        """Queue a user message for upcoming run(s). Returns total queued count."""
+        cleaned = message.strip()
+        if cleaned:
+            self.message_queue.append(cleaned)
+            logger.info(f"Queued message (position {len(self.message_queue)}): '{cleaned[:50]}'")
+        return len(self.message_queue)
+
+    def has_queued_messages(self) -> bool:
+        """Check if any messages are waiting in queue."""
+        return len(self.message_queue) > 0
+
+    def pop_queued_message(self) -> Optional[str]:
+        """Pop and return next queued message, or None if empty."""
+        if self.message_queue:
+            return self.message_queue.pop(0)
+        return None
+
+    def get_queued_messages(self) -> List[str]:
+        """Get copy of all queued messages."""
+        return list(self.message_queue)
+
+    def clear_message_queue(self) -> int:
+        """Clear all queued messages. Returns number of cleared messages."""
+        count = len(self.message_queue)
+        self.message_queue.clear()
+        return count
+
+    def enlighten(self, question: str, answer: str) -> None:
+        """Inject /btw question and direct answer into agent context so ongoing/future steps are enlightened."""
+        self.context.add_user_message(f"[Side Note / BTW from User]: {question}")
+        self.context.add_assistant_message(f"[Direct Answer / Guidance]: {answer}")
+        self.session_manager.log_message("BTW_USER", question)
+        self.session_manager.log_message("BTW_AGENT", answer)
+        self.save_session()
+        logger.info(f"Agent enlightened with /btw note: '{question[:50]}'")
+
+    async def ask_direct(self, question: str) -> str:
+        """Directly query the model for a quick answer without executing tools,
+        and inject the clarification into the running context to guide the agent."""
+        recent_msgs = self.context.get_messages_for_model()
+        # Keep up to last 8 non-system messages for context
+        trimmed = [m for m in recent_msgs[-8:] if m.get("role") != "system"]
+
+        system_msg = {
+            "role": "system",
+            "content": (
+                "You are an AI coding assistant (ireri). The user is asking a direct, "
+                "side question or giving advice ('by the way') while an ongoing task may be in progress. "
+                "Answer clearly, concisely, and helpfully. Do not attempt to call tools. "
+                "Your answer will be directly shown to the user and immediately recorded into the "
+                "running agent's context to enlighten and guide its subsequent steps."
+            ),
+        }
+
+        messages = [system_msg] + trimmed + [{"role": "user", "content": question}]
+
+        try:
+            response = await self.model_client.chat(
+                messages=messages,
+                tools=None,
+                temperature=0.2,
+            )
+            answer = response.content or "(No response from model)"
+        except Exception as e:
+            logger.error(f"/btw direct model call failed: {e}")
+            self.session_manager.log_error("BTW_ERROR", str(e), {"question": question})
+            return f"Error contacting model: {e}"
+
+        self.enlighten(question, answer)
+        return answer
+
     def cancel(self) -> None:
         """Cancel the current task."""
         self.cancelled = True
@@ -417,6 +493,7 @@ class AgentController:
             "iteration": self.context.get_iteration_count(),
             "tool_calls": self.context.get_tool_calls_count(),
             "last_error": self.last_error,
+            "queued_messages": len(self.message_queue),
         }
 
 

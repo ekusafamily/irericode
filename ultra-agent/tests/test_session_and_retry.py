@@ -189,3 +189,66 @@ def test_session_manager_error_log(tmp_path: Path):
     assert recent[-1]["message"] == "Task cancelled by Ctrl+C"
 
 
+def test_controller_message_queue(tmp_path: Path):
+    """Verify message queuing functionality in AgentController."""
+    sm = SessionManager(workspace_root=tmp_path)
+    controller = AgentController(session_manager=sm)
+
+    assert not controller.has_queued_messages()
+    assert controller.get_queued_messages() == []
+
+    # Queue multiple messages
+    assert controller.queue_message("task 1") == 1
+    assert controller.queue_message("task 2") == 2
+    assert controller.queue_message("task 3") == 3
+
+    assert controller.has_queued_messages()
+    assert controller.get_queued_messages() == ["task 1", "task 2", "task 3"]
+
+    # Pop message
+    popped = controller.pop_queued_message()
+    assert popped == "task 1"
+    assert len(controller.get_queued_messages()) == 2
+
+    # Clear queue
+    cleared = controller.clear_message_queue()
+    assert cleared == 2
+    assert not controller.has_queued_messages()
+
+
+@pytest.mark.asyncio
+async def test_controller_btw_direct_chat_and_enlighten(tmp_path: Path):
+    """Verify that /btw calls the model directly without tools and enlightens the agent context."""
+    sm = SessionManager(workspace_root=tmp_path)
+    controller = AgentController(session_manager=sm)
+
+    # Mock model client chat response
+    mock_response = ModelResponse(content="We are using PostgreSQL with asyncpg.")
+    controller.model_client.chat = AsyncMock(return_value=mock_response)
+
+    # Ask direct question via /btw
+    question = "What database are we using?"
+    answer = await controller.ask_direct(question)
+
+    assert answer == "We are using PostgreSQL with asyncpg."
+    # Verify model was called with tools=None (pure chat, no tools)
+    call_kwargs = controller.model_client.chat.call_args.kwargs
+    assert call_kwargs.get("tools") is None
+
+    # Verify context was enlightened with both question and answer
+    user_msgs = [m for m in controller.context.messages if m.role == "user" and "[Side Note / BTW from User]" in m.content]
+    assistant_msgs = [m for m in controller.context.messages if m.role == "assistant" and "[Direct Answer / Guidance]" in m.content]
+    assert len(user_msgs) == 1
+    assert question in user_msgs[0].content
+    assert len(assistant_msgs) == 1
+    assert "PostgreSQL with asyncpg" in assistant_msgs[0].content
+
+    # Verify history log also captured the enlightenment
+    assert sm.history_file.exists()
+    log_text = sm.history_file.read_text(encoding="utf-8")
+    assert "[BTW_USER]" in log_text
+    assert question in log_text
+    assert "[BTW_AGENT]" in log_text
+
+
+

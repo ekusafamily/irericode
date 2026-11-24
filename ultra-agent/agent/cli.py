@@ -316,36 +316,56 @@ async def _chat_async(
         )
         console.print(Panel(approval_text, border_style="dim", box=ROUNDED, padding=(0, 1), width=console.width - 4))
         options_text = Text.from_markup(
-            "Options: [bold]y[/bold]=approve  [bold]n[/bold]=deny  [bold]a[/bold]=approve all  [bold]d[/bold]=deny all",
+            "Options: [bold]y[/bold]=approve  [bold]n[/bold]=deny  [bold]a[/bold]=approve all  [bold]d[/bold]=deny all  [bold]/btw <q>[/bold]=ask model",
             justify="center",
         )
         console.print(Panel(options_text, border_style="dim", box=ROUNDED, padding=(0, 1), width=console.width - 4))
 
-        # Run blocking Prompt.ask in executor to avoid blocking event loop
-        loop = asyncio.get_event_loop()
-        choice = await loop.run_in_executor(
-            None,
-            lambda: Prompt.ask(
-                "[bold cyan]Approve?[/bold cyan]",
-                choices=["y", "n", "a", "d"],
-                default="y",
-                case_sensitive=False,
+        while True:
+            # Run blocking Prompt.ask in executor to avoid blocking event loop
+            loop = asyncio.get_event_loop()
+            raw_choice = await loop.run_in_executor(
+                None,
+                lambda: Prompt.ask(
+                    "[bold cyan]Approve? [y/n/a/d][/bold cyan]",
+                    default="y",
+                )
             )
-        )
-        choice = str(choice).strip().lower()
+            raw_choice = str(raw_choice).strip()
 
-        if choice == "a":
-            controller.set_approve_all(True)
-            console.print(render_system_message("[green]Approved all future tool calls for this session[/green]"))
-            return True
-        elif choice == "d":
-            controller.set_deny_all(True)
-            console.print(render_system_message("[red]Denied all future tool calls for this session[/red]"))
-            return False
-        elif choice == "y":
-            return True
-        else:
-            return False
+            if raw_choice.lower().startswith("/btw"):
+                question = raw_choice[4:].strip()
+                if question:
+                    await _handle_btw_command(question, controller)
+                else:
+                    console.print("[yellow]Usage: /btw <question>[/yellow]")
+                continue
+
+            if raw_choice.lower().startswith("/queue"):
+                q_parts = raw_choice.split()
+                _handle_queue_command(q_parts, controller)
+                continue
+
+            choice = raw_choice.lower()
+            if choice == "a":
+                controller.set_approve_all(True)
+                console.print(render_system_message("[green]Approved all future tool calls for this session[/green]"))
+                return True
+            elif choice == "d":
+                controller.set_deny_all(True)
+                console.print(render_system_message("[red]Denied all future tool calls for this session[/red]"))
+                return False
+            elif choice in ("y", "yes"):
+                return True
+            elif choice in ("n", "no"):
+                return False
+            else:
+                # If user typed another instruction while waiting, queue it for next run!
+                q_len = controller.queue_message(raw_choice)
+                console.print(render_system_message(
+                    f"[green]✓ Queued task #{q_len}:[/green] [white]{raw_choice}[/white]\n"
+                    f"[dim]Please approve or deny the current tool call to proceed.[/dim]"
+                ))
 
     controller.approval_callback = _approval_callback
 
@@ -439,17 +459,31 @@ async def _chat_async(
                     console.print(render_agent_message(response))
                     continue
 
-                # Run task with progress and thinking animation
-                try:
-                    result = await controller.run_task(
-                        user_input,
-                        progress_callback=lambda event, data: _progress_callback(event, data, thinking),
-                    )
-                finally:
-                    thinking.stop()
+                # Run task with progress and thinking animation, draining any queued messages
+                current_task = user_input
+                while current_task:
+                    try:
+                        result = await controller.run_task(
+                            current_task,
+                            progress_callback=lambda event, data: _progress_callback(event, data, thinking),
+                        )
+                    finally:
+                        thinking.stop()
 
-                # Display result on the left
-                console.print(render_agent_message(result))
+                    # Display result on the left
+                    console.print(render_agent_message(result))
+
+                    # Process next queued message if available
+                    if controller.has_queued_messages():
+                        current_task = controller.pop_queued_message()
+                        remaining = len(controller.message_queue)
+                        console.print()
+                        console.print(render_system_message(
+                            f"[bold cyan]▶ Running queued task ({remaining} remaining in queue):[/bold cyan] [white]{current_task}[/white]"
+                        ))
+                        console.print(render_user_message(current_task))
+                    else:
+                        current_task = None
 
             except (typer.Exit, SystemExit):
                 break
@@ -476,6 +510,8 @@ async def _chat_async(
 
 # Available slash commands for auto-completion
 SLASH_COMMANDS = {
+    "/btw": "Ask a direct question to the model & enlighten the agent without disrupting running tasks",
+    "/queue": "View, add, or clear queued tasks for upcoming runs",
     "/help": "Display all available commands",
     "/provider": "Configure AI providers (NVIDIA, OpenAI, etc.)",
     "/settings": "Open interactive settings & API profiles",
@@ -496,6 +532,8 @@ SLASH_COMMANDS = {
 
 # Command icons for auto-completion display
 SLASH_COMMAND_ICONS = {
+    "/btw": "💡",
+    "/queue": "📥",
     "/help": "✦",
     "/provider": "⚡",
     "/settings": "⚙",
@@ -617,7 +655,21 @@ async def _handle_slash_command(command: str, controller: AgentController) -> No
     parts = command.split()
     cmd = parts[0].lower()
 
-    if cmd == "/help":
+    if cmd == "/btw":
+        question = command[4:].strip() if len(command) > 4 else ""
+        if not question:
+            console.print("[yellow]Usage: /btw <your question or side note>[/yellow]")
+            console.print("[dim]Example: /btw what database are we using?[/dim]")
+            console.print("[dim]Example: /btw make sure to write clean docstrings[/dim]")
+            return True
+        await _handle_btw_command(question, controller)
+        return True
+
+    elif cmd == "/queue":
+        _handle_queue_command(parts, controller)
+        return True
+
+    elif cmd == "/help":
         _show_help()
         return True
 
@@ -755,6 +807,81 @@ def _show_errors_command(controller: AgentController, parts: list) -> None:
     console.print(table)
     console.print(render_system_message(
         f"[dim]Full error log at: [underline]{controller.session_manager.error_log_file}[/underline][/dim]"
+    ))
+    console.print()
+
+
+async def _handle_btw_command(question: str, controller: AgentController) -> None:
+    """Execute direct side-question to model and display enlightened response."""
+    console.print()
+    console.print(Panel(
+        f"[bold bright_yellow]Q:[/bold bright_yellow] {question}\n\n[dim]Consulting model directly...[/dim]",
+        title="[bold yellow]💡 By the Way (Direct Side-Chat)[/bold yellow]",
+        border_style="yellow",
+        box=ROUNDED,
+        padding=(0, 1),
+    ))
+
+    answer = await controller.ask_direct(question)
+
+    console.print()
+    console.print(Panel(
+        Markdown(answer),
+        title="[bold bright_green]ireri (Direct Answer)[/bold bright_green]",
+        subtitle="[dim]✓ Injected into agent context to guide ongoing & subsequent steps[/dim]",
+        border_style="bright_yellow",
+        box=ROUNDED,
+        padding=(0, 1),
+    ))
+    console.print()
+
+
+def _handle_queue_command(parts: list, controller: AgentController) -> None:
+    """Handle /queue slash command to view, add, or clear queued messages."""
+    sub = parts[1].lower() if len(parts) > 1 else ""
+
+    if sub in ("clear", "reset"):
+        count = controller.clear_message_queue()
+        console.print(render_system_message(f"[green]Cleared {count} queued message(s).[/green]"))
+        return
+
+    if sub == "add" and len(parts) > 2:
+        msg = " ".join(parts[2:]).strip()
+        q_len = controller.queue_message(msg)
+        console.print(render_system_message(f"[green]✓ Queued task #{q_len}:[/green] [white]{msg}[/white]"))
+        return
+
+    # If sub is not a reserved keyword but user typed: /queue do something
+    if sub and sub not in ("list", "show") and len(parts) >= 2:
+        msg = " ".join(parts[1:]).strip()
+        q_len = controller.queue_message(msg)
+        console.print(render_system_message(f"[green]✓ Queued task #{q_len}:[/green] [white]{msg}[/white]"))
+        return
+
+    queued = controller.get_queued_messages()
+    if not queued:
+        console.print(render_system_message(
+            "[dim]Message queue is currently empty.\n"
+            "Queue upcoming tasks with [bold cyan]/queue <message>[/bold cyan] or while running.\n"
+            "They will automatically execute in order after the active task finishes.[/dim]"
+        ))
+        return
+
+    table = Table(title=f"Queued Messages ({len(queued)} pending)", box=ROUNDED, border_style="cyan")
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Queued Task", style="white")
+
+    for idx, msg in enumerate(queued, 1):
+        preview = msg.replace("\n", " ")
+        if len(preview) > 85:
+            preview = preview[:82] + "..."
+        table.add_row(str(idx), preview)
+
+    console.print()
+    console.print(table)
+    console.print(render_system_message(
+        "[dim]These tasks will automatically run in sequence after the current task finishes.\n"
+        "Use [bold cyan]/queue add <task>[/bold cyan] to queue more, or [bold cyan]/queue clear[/bold cyan] to remove all.[/dim]"
     ))
     console.print()
 
@@ -1603,6 +1730,7 @@ def _show_status_command(controller: AgentController) -> None:
     table.add_row("Workspace", str(config.workspace_root))
     table.add_row("Max Iterations", str(config.max_iterations))
     table.add_row("Max Tool Calls", str(config.max_tool_calls))
+    table.add_row("Queued Tasks", str(len(controller.message_queue)))
     table.add_row("Session", "Active")
 
     console.print()
