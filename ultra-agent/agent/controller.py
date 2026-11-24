@@ -404,8 +404,19 @@ class AgentController:
                 "args": args_dict,
             })
 
-        # Check approval
-        if tool.requires_approval:
+        # Check configured tool access policy ("allow", "ask", or "deny")
+        default_policy = "ask" if tool.requires_approval else "allow"
+        policy = self.config.get_tool_access(tool_name, default=default_policy)
+
+        if policy == "deny":
+            if self.progress_callback:
+                self.progress_callback("tool_denied", {"tool": tool_name, "reason": "policy"})
+            return ToolResult(
+                success=False,
+                error=f"Tool '{tool_name}' is denied by tool access settings (/settings tools)."
+            )
+
+        if policy == "ask":
             approved = await self._request_approval(tool_name, args_dict, tool.dangerous)
             if not approved:
                 if self.progress_callback:

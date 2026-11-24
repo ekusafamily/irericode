@@ -3,7 +3,7 @@
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -56,8 +56,35 @@ class AgentConfig(BaseSettings):
         description="Logging level (DEBUG, INFO, WARNING, ERROR)"
     )
 
+    # Tool Access Policies ("allow", "ask", "deny")
+    tool_access: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Per-tool access policies (allow, ask, deny)"
+    )
+
     # workspace_root is not a pydantic field - managed via property
     _workspace_root: Optional[Path] = None
+
+    def get_tool_access(self, tool_name: str, default: str = "ask") -> str:
+        """Get configured access policy for a tool ('allow', 'ask', or 'deny')."""
+        policy = self.tool_access.get(tool_name, default)
+        if policy in ("allow", "ask", "deny"):
+            return policy
+        return default
+
+    def set_tool_access(self, tool_name: str, policy: str) -> None:
+        """Set access policy for a tool ('allow', 'ask', or 'deny')."""
+        normalized = policy.strip().lower()
+        if normalized not in ("allow", "ask", "deny"):
+            raise ValueError(f"Invalid tool access policy '{policy}'. Must be 'allow', 'ask', or 'deny'.")
+        self.tool_access[tool_name] = normalized
+
+    def reset_tool_access(self, tool_name: Optional[str] = None) -> None:
+        """Reset tool access policy override for one tool or all tools."""
+        if tool_name is None:
+            self.tool_access.clear()
+        else:
+            self.tool_access.pop(tool_name, None)
 
     @property
     def workspace_root(self) -> Path:
@@ -81,6 +108,7 @@ class AgentConfig(BaseSettings):
             "max_tool_calls": self.max_tool_calls,
             "command_timeout": self.command_timeout,
             "log_level": self.log_level,
+            "tool_access": dict(self.tool_access),
         }
 
     @classmethod

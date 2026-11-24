@@ -247,6 +247,177 @@ class ThinkingIndicator:
         return _AwaitableNone()
 
 
+async def _prompt_arrow_menu(
+    title: str,
+    options: List[Dict[str, Any]],
+    hotkeys: Optional[Dict[str, str]] = None,
+    subtitle: str = "Use ↑/↓ arrows + Enter to select (or press shortcut key)",
+) -> Optional[str]:
+    """Render an interactive arrow-key selection menu using prompt_toolkit.
+
+    Returns the selected option's 'key', or None if cancelled/unavailable.
+    """
+    if not sys.stdin.isatty():
+        raise RuntimeError("stdin is not a TTY")
+
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import Layout, HSplit, Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.styles import Style
+
+    selected_idx = 0
+    kb = KeyBindings()
+
+    @kb.add("up")
+    @kb.add("k")
+    def _up(event):
+        nonlocal selected_idx
+        selected_idx = (selected_idx - 1) % len(options)
+
+    @kb.add("down")
+    @kb.add("j")
+    def _down(event):
+        nonlocal selected_idx
+        selected_idx = (selected_idx + 1) % len(options)
+
+    @kb.add("enter")
+    def _enter(event):
+        event.app.exit(result=options[selected_idx]["key"])
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _cancel(event):
+        event.app.exit(result=None)
+
+    if hotkeys:
+        for hk, target_key in hotkeys.items():
+            @kb.add(hk)
+            def _hotkey(event, _target=target_key):
+                event.app.exit(result=_target)
+
+    def _get_formatted_text():
+        lines = []
+        if title:
+            lines.append(("class:title", f"  {title}\n"))
+        if subtitle:
+            lines.append(("class:subtitle", f"  {subtitle}\n"))
+        for idx, opt in enumerate(options):
+            is_sel = idx == selected_idx
+            pointer = "  ❯ " if is_sel else "    "
+            style_cls = "class:selected" if is_sel else opt.get("pt_style", "class:item")
+            lines.append((style_cls, f"{pointer}{opt['label']}\n"))
+        return lines
+
+    style = Style.from_dict({
+        "title": "bold ansibrightcyan",
+        "subtitle": "ansibrightblack",
+        "selected": "bold ansibrightyellow reverse",
+        "item": "ansiwhite",
+        "allow": "ansigreen",
+        "deny": "ansired",
+        "accent": "ansicyan",
+    })
+
+    app = Application(
+        layout=Layout(HSplit([Window(content=FormattedTextControl(_get_formatted_text))])),
+        key_bindings=kb,
+        style=style,
+        full_screen=False,
+        erase_when_done=True,
+    )
+    return await app.run_async()
+
+
+async def _prompt_tool_approval_interactive(
+    tool_name: str,
+    args: Dict[str, Any],
+    dangerous: bool,
+    controller: AgentController,
+) -> Optional[bool]:
+    """Interactive arrow-key selector for tool approval.
+
+    Returns True (approved), False (denied), or raises RuntimeError if TTY is unavailable.
+    """
+    from agent.config import _save_global_config
+
+    while True:
+        options = [
+            {"key": "approve_once", "label": "[y] ✓ Approve once", "pt_style": "class:allow"},
+            {"key": "deny_once", "label": "[n] ✗ Deny once", "pt_style": "class:deny"},
+            {"key": "always_allow", "label": f"[p] ★ Always allow '{tool_name}' (save to /settings)", "pt_style": "class:allow"},
+            {"key": "always_deny", "label": f"[b] ⊘ Never allow '{tool_name}' (save deny to /settings)", "pt_style": "class:deny"},
+            {"key": "approve_all", "label": "[a] ✓✓ Approve all for this session", "pt_style": "class:accent"},
+            {"key": "deny_all", "label": "[d] ✗✗ Deny all for this session", "pt_style": "class:deny"},
+            {"key": "chat", "label": "[/] 💬 Ask model (/btw) or queue a message", "pt_style": "class:item"},
+        ]
+        hotkeys = {
+            "y": "approve_once",
+            "Y": "approve_once",
+            "n": "deny_once",
+            "N": "deny_once",
+            "p": "always_allow",
+            "P": "always_allow",
+            "b": "always_deny",
+            "B": "always_deny",
+            "a": "approve_all",
+            "A": "approve_all",
+            "d": "deny_all",
+            "D": "deny_all",
+            "/": "chat",
+        }
+
+        choice = await _prompt_arrow_menu(
+            title=f"Choose action for '{tool_name}':",
+            options=options,
+            hotkeys=hotkeys,
+        )
+
+        if choice is None or choice == "deny_once":
+            console.print("  [red]✗ Denied[/red]")
+            return False
+        elif choice == "approve_once":
+            console.print("  [green]✓ Approved[/green]")
+            return True
+        elif choice == "always_allow":
+            controller.config.set_tool_access(tool_name, "allow")
+            _save_global_config(controller.config)
+            console.print(render_system_message(f"[green]✓ Always allowing '{tool_name}' (saved to /settings)[/green]"))
+            return True
+        elif choice == "always_deny":
+            controller.config.set_tool_access(tool_name, "deny")
+            _save_global_config(controller.config)
+            console.print(render_system_message(f"[red]⊘ Tool '{tool_name}' set to deny (saved to /settings)[/red]"))
+            return False
+        elif choice == "approve_all":
+            controller.set_approve_all(True)
+            console.print(render_system_message("[green]✓✓ Approved all future tool calls for this session[/green]"))
+            return True
+        elif choice == "deny_all":
+            controller.set_deny_all(True)
+            console.print(render_system_message("[red]✗✗ Denied all future tool calls for this session[/red]"))
+            return False
+        elif choice == "chat":
+            loop = asyncio.get_event_loop()
+            msg = await loop.run_in_executor(
+                None,
+                lambda: Prompt.ask("[bold cyan]Enter /btw <question> or message to queue (blank to go back)[/bold cyan]", default="")
+            )
+            cleaned = msg.strip()
+            if not cleaned:
+                continue
+            if cleaned.lower().startswith("/btw"):
+                question = cleaned[4:].strip()
+                if question:
+                    await _handle_btw_command(question, controller)
+                else:
+                    console.print("[yellow]Usage: /btw <question>[/yellow]")
+            else:
+                q_len = controller.queue_message(cleaned)
+                console.print(render_system_message(f"[green]✓ Queued message #{q_len}:[/green] [white]{cleaned}[/white]"))
+            # Loop back to the approval selector
+
+
 async def _chat_async(
     project: Optional[Path],
     model: Optional[str],
@@ -322,9 +493,22 @@ async def _chat_async(
 
     thinking = ThinkingIndicator(console)
 
+    # Initialize prompt_toolkit session with auto-completion and dynamic prompt
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.shortcuts import CompleteStyle
+    pt_completer = SlashCommandCompleter()
+    pt_session = PromptSession(
+        erase_when_done=True,
+        completer=pt_completer,
+        complete_while_typing=True,
+        complete_style=CompleteStyle.COLUMN,
+        style=SLASH_COMPLETION_STYLE,
+    )
+    approval_handoff_event = asyncio.Event()
+
     # Define approval callback for interactive mode
     async def _approval_callback(tool_name: str, args: Dict[str, Any], dangerous: bool) -> bool:
-        """Prompt user for tool approval with support for /btw and message queuing."""
+        """Prompt user for tool approval with interactive arrow selection and /btw support."""
         if controller._approve_all:
             return True
         if controller._deny_all:
@@ -341,43 +525,52 @@ async def _chat_async(
         # Build prompt message
         danger_indicator = " [red]! DANGEROUS[/red]" if dangerous else ""
         console.print()
-        # Use console.print directly for proper Rich markup rendering
         approval_text = Text.from_markup(
             f"[yellow]Approval required:[/yellow] {escape(tool_name)}({escape(args_display)}){danger_indicator}",
             justify="center",
         )
-        console.print(Panel(approval_text, border_style="dim", box=ROUNDED, padding=(0, 1), width=console.width - 4))
-        options_text = Text.from_markup(
-            "Options: [bold]y[/bold]=approve  [bold]n[/bold]=deny  [bold]a[/bold]=approve all  [bold]d[/bold]=deny all  [bold]/btw <q>[/bold]=ask model",
-            justify="center",
-        )
-        console.print(Panel(options_text, border_style="dim", box=ROUNDED, padding=(0, 1), width=console.width - 4))
+        console.print(Panel(approval_text, border_style="yellow" if not dangerous else "red", box=ROUNDED, padding=(0, 1), width=console.width - 4))
 
         loop = asyncio.get_event_loop()
         future = loop.create_future()
         controller.active_approval = future
 
+        # Hand off stdin from pt_session if it is currently running
         try:
-            approved = await future
-            return approved
+            if pt_session.app.is_running:
+                approval_handoff_event.clear()
+                pt_session.app.exit(result="__APPROVAL_HANDOFF__")
+                try:
+                    await asyncio.wait_for(approval_handoff_event.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            # Try interactive arrow-key selector first
+            try:
+                approved = await _prompt_tool_approval_interactive(tool_name, args, dangerous, controller)
+                if not future.done():
+                    future.set_result(approved)
+                return approved
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Fallback to text-based prompt for non-TTY / automated environments
+                options_text = Text.from_markup(
+                    "Options: [bold]y[/bold]=approve  [bold]n[/bold]=deny  [bold]a[/bold]=approve all  [bold]d[/bold]=deny all  [bold]/btw <q>[/bold]=ask model",
+                    justify="center",
+                )
+                console.print(Panel(options_text, border_style="dim", box=ROUNDED, padding=(0, 1), width=console.width - 4))
+                approved = await future
+                return approved
         except asyncio.CancelledError:
             return False
         finally:
             controller.active_approval = None
 
     controller.approval_callback = _approval_callback
-
-    # Initialize prompt_toolkit session with auto-completion and dynamic prompt
-    from prompt_toolkit import PromptSession
-    from prompt_toolkit.shortcuts import CompleteStyle
-    pt_completer = SlashCommandCompleter()
-    pt_session = PromptSession(
-        erase_when_done=True,
-        completer=pt_completer,
-        complete_while_typing=True,
-        complete_style=CompleteStyle.COLUMN,
-        style=SLASH_COMPLETION_STYLE,
-    )
 
     background_worker_task: Optional[asyncio.Task] = None
 
@@ -444,6 +637,14 @@ async def _chat_async(
         nonlocal background_worker_task
         while True:
             try:
+                # If interactive approval is currently active on TTY, wait for it to finish
+                if controller.active_approval and not controller.active_approval.done() and sys.stdin.isatty():
+                    try:
+                        await asyncio.shield(controller.active_approval)
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    continue
+
                 console.print()
                 # Get user input with prompt_toolkit, falling back to readline/input
                 try:
@@ -462,6 +663,15 @@ async def _chat_async(
                         None,
                         lambda: _get_input_with_readline()
                     )
+
+                if user_input == "__APPROVAL_HANDOFF__":
+                    approval_handoff_event.set()
+                    if controller.active_approval and not controller.active_approval.done():
+                        try:
+                            await asyncio.shield(controller.active_approval)
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    continue
 
                 if user_input.lower() in ("exit", "quit", "q"):
                     if background_worker_task and not background_worker_task.done():
@@ -1137,6 +1347,230 @@ def _show_config_table(config: AgentConfig) -> None:
     console.print()
 
 
+async def _interactive_tool_access_edit(controller: Optional[AgentController] = None) -> None:
+    """Interactive arrow-key editor for per-tool access policies (allow / ask / deny)."""
+    from agent.config import _save_global_config
+
+    config = controller.config if controller else get_config()
+    registry = get_registry()
+    tools = sorted(registry.get_all(), key=lambda t: t.name)
+
+    if not tools:
+        console.print("[yellow]No tools registered.[/yellow]")
+        return
+
+    policy_order = ["allow", "ask", "deny"]
+
+    def _cycle_policy(tool, direction: int = 1):
+        default_p = "ask" if tool.requires_approval else "allow"
+        cur = config.get_tool_access(tool.name, default=default_p)
+        idx = policy_order.index(cur) if cur in policy_order else 1
+        nxt = policy_order[(idx + direction) % len(policy_order)]
+        config.set_tool_access(tool.name, nxt)
+        _save_global_config(config)
+
+    # Interactive prompt_toolkit mode when TTY is available
+    if sys.stdin.isatty():
+        try:
+            from prompt_toolkit.application import Application
+            from prompt_toolkit.key_binding import KeyBindings
+            from prompt_toolkit.layout import Layout, HSplit, Window
+            from prompt_toolkit.layout.controls import FormattedTextControl
+            from prompt_toolkit.styles import Style
+
+            selected_idx = 0
+            total_items = len(tools) + 2  # tools + Reset all + Done
+            kb = KeyBindings()
+
+            @kb.add("up")
+            @kb.add("k")
+            def _up(event):
+                nonlocal selected_idx
+                selected_idx = (selected_idx - 1) % total_items
+
+            @kb.add("down")
+            @kb.add("j")
+            def _down(event):
+                nonlocal selected_idx
+                selected_idx = (selected_idx + 1) % total_items
+
+            @kb.add("right")
+            @kb.add("l")
+            @kb.add(" ")
+            def _cycle_next(event):
+                if selected_idx < len(tools):
+                    _cycle_policy(tools[selected_idx], 1)
+
+            @kb.add("left")
+            @kb.add("h")
+            def _cycle_prev(event):
+                if selected_idx < len(tools):
+                    _cycle_policy(tools[selected_idx], -1)
+
+            @kb.add("enter")
+            def _enter(event):
+                if selected_idx < len(tools):
+                    _cycle_policy(tools[selected_idx], 1)
+                elif selected_idx == len(tools):
+                    config.reset_tool_access()
+                    _save_global_config(config)
+                else:
+                    event.app.exit(result=True)
+
+            @kb.add("q")
+            @kb.add("escape")
+            @kb.add("c-c")
+            def _exit(event):
+                event.app.exit(result=True)
+
+            def _render():
+                lines = [
+                    ("class:title", "  Tool Access Settings (/settings tools)\n"),
+                    ("class:subtitle", "  ↑/↓: navigate  •  ←/→/Space/Enter: change [ALLOW / ASK / DENY]  •  q/Esc: save & exit\n\n"),
+                ]
+                for idx, tool in enumerate(tools):
+                    is_sel = idx == selected_idx
+                    default_p = "ask" if tool.requires_approval else "allow"
+                    policy = config.get_tool_access(tool.name, default=default_p)
+                    danger = " !DANGEROUS" if tool.dangerous else ""
+                    pointer = "  ❯ " if is_sel else "    "
+                    badge = f"[{policy.upper():5}]"
+                    row_text = f"{pointer}{tool.name:<18} {badge}  {tool.description[:42]}{danger}\n"
+                    if is_sel:
+                        lines.append(("class:selected", row_text))
+                    elif policy == "allow":
+                        lines.append(("class:allow", row_text))
+                    elif policy == "deny":
+                        lines.append(("class:deny", row_text))
+                    else:
+                        lines.append(("class:ask", row_text))
+
+                lines.append(("class:subtitle", "\n"))
+                reset_sel = selected_idx == len(tools)
+                done_sel = selected_idx == len(tools) + 1
+                lines.append((
+                    "class:selected" if reset_sel else "class:subtitle",
+                    f"{'  ❯ ' if reset_sel else '    '}↺ Reset all tools to defaults\n",
+                ))
+                lines.append((
+                    "class:selected" if done_sel else "class:allow",
+                    f"{'  ❯ ' if done_sel else '    '}✓ Save & Done\n",
+                ))
+                return lines
+
+            style = Style.from_dict({
+                "title": "bold ansibrightcyan",
+                "subtitle": "ansibrightblack",
+                "selected": "bold ansibrightyellow reverse",
+                "allow": "ansigreen",
+                "ask": "ansiyellow",
+                "deny": "ansired",
+            })
+
+            app = Application(
+                layout=Layout(HSplit([Window(content=FormattedTextControl(_render))])),
+                key_bindings=kb,
+                style=style,
+                full_screen=False,
+                erase_when_done=True,
+            )
+            await app.run_async()
+            console.print(render_system_message("[green]✓ Tool access settings saved.[/green]"))
+            return
+        except Exception:
+            pass
+
+    # Fallback numbered prompt for non-TTY / automated environments
+    loop = asyncio.get_event_loop()
+    while True:
+        console.print()
+        console.print("[bold bright_cyan]Tool Access Settings[/bold bright_cyan]")
+        for i, tool in enumerate(tools, 1):
+            default_p = "ask" if tool.requires_approval else "allow"
+            policy = config.get_tool_access(tool.name, default=default_p)
+            color = "green" if policy == "allow" else ("red" if policy == "deny" else "yellow")
+            console.print(f"  [bold]{i}[/bold]) {tool.name:<18} [{color}]{policy.upper()}[/{color}] [dim]- {tool.description}[/dim]")
+        console.print("  [bold]r[/bold]) Reset all to defaults")
+        console.print("  [bold]0[/bold]) Done")
+
+        valid = [str(i) for i in range(len(tools) + 1)] + ["r"]
+        choice = await loop.run_in_executor(
+            None,
+            lambda: Prompt.ask("[bold cyan]Select tool to toggle[/bold cyan]", choices=valid, default="0")
+        )
+        if choice == "0":
+            break
+        elif choice == "r":
+            config.reset_tool_access()
+            _save_global_config(config)
+            console.print(render_system_message("[green]Reset all tool access policies to defaults.[/green]"))
+        else:
+            tool = tools[int(choice) - 1]
+            _cycle_policy(tool, 1)
+            new_p = config.get_tool_access(tool.name)
+            console.print(render_system_message(f"[green]{tool.name} access set to '{new_p}'.[/green]"))
+
+
+async def _handle_tools_settings_command(args: list, controller: Optional[AgentController] = None) -> None:
+    """Handle `/settings tools` subcommands."""
+    from agent.config import _save_global_config
+
+    config = controller.config if controller else get_config()
+    registry = get_registry()
+    valid_tools = {t.name: t for t in registry.get_all()}
+
+    if not args:
+        await _interactive_tool_access_edit(controller)
+        return
+
+    if args[0].lower() == "reset":
+        if len(args) > 1 and args[1] in valid_tools:
+            config.reset_tool_access(args[1])
+            _save_global_config(config)
+            console.print(render_system_message(f"[green]Reset '{args[1]}' access to default.[/green]"))
+        else:
+            config.reset_tool_access()
+            _save_global_config(config)
+            console.print(render_system_message("[green]Reset all tool access policies to defaults.[/green]"))
+        return
+
+    if len(args) < 2:
+        console.print("[red]Usage: /settings tools <tool_name|all> <allow|ask|deny|reset>[/red]")
+        return
+
+    target_tool = args[0]
+    policy = args[1].lower()
+
+    if policy == "reset":
+        if target_tool == "all":
+            config.reset_tool_access()
+            _save_global_config(config)
+            console.print(render_system_message("[green]Reset all tool access policies to defaults.[/green]"))
+        elif target_tool in valid_tools:
+            config.reset_tool_access(target_tool)
+            _save_global_config(config)
+            console.print(render_system_message(f"[green]Reset '{target_tool}' access to default.[/green]"))
+        else:
+            console.print(render_system_message(f"[red]Unknown tool: {target_tool}[/red]"))
+        return
+
+    if policy not in ("allow", "ask", "deny"):
+        console.print(render_system_message(f"[red]Invalid policy '{policy}'. Use: allow, ask, deny, or reset.[/red]"))
+        return
+
+    if target_tool == "all":
+        for name in valid_tools:
+            config.set_tool_access(name, policy)
+        _save_global_config(config)
+        console.print(render_system_message(f"[green]Set access for ALL tools to '{policy}'.[/green]"))
+    elif target_tool in valid_tools:
+        config.set_tool_access(target_tool, policy)
+        _save_global_config(config)
+        console.print(render_system_message(f"[green]Set '{target_tool}' access to '{policy}'.[/green]"))
+    else:
+        console.print(render_system_message(f"[red]Unknown tool: {target_tool}. Available: {', '.join(sorted(valid_tools))}[/red]"))
+
+
 async def _interactive_config_edit(controller: Optional[AgentController] = None) -> None:
     """Interactive wizard to change any configuration setting."""
     config = get_config()
@@ -1149,17 +1583,22 @@ async def _interactive_config_edit(controller: Optional[AgentController] = None)
     console.print(f"  [bold]5[/bold]) Base URL           [dim](current: {config.openai_base_url})[/dim]")
     console.print(f"  [bold]6[/bold]) API Key            [dim](current: {('***' + config.openai_api_key[-4:]) if config.openai_api_key else 'Not set'})[/dim]")
     console.print(f"  [bold]7[/bold]) Log Level          [dim](current: {config.log_level})[/dim]")
+    console.print(f"  [bold]8[/bold]) Tool Access        [dim]({len(config.tool_access)} custom rule(s))[/dim]")
     console.print("  [bold]0[/bold]) Cancel")
 
     import asyncio
     loop = asyncio.get_event_loop()
     choice = await loop.run_in_executor(
         None,
-        lambda: Prompt.ask("[bold cyan]Select setting to edit[/bold cyan]", choices=["0", "1", "2", "3", "4", "5", "6", "7"], default="1")
+        lambda: Prompt.ask("[bold cyan]Select setting to edit[/bold cyan]", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8"], default="1")
     )
 
     if choice == "0":
         console.print("[dim]Edit cancelled.[/dim]")
+        return
+
+    if choice == "8":
+        await _interactive_tool_access_edit(controller)
         return
 
     mapping = {
@@ -1281,9 +1720,17 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
         await _interactive_config_edit(controller)
         return
 
+    elif subcommand in ("tools", "tool", "access"):
+        await _handle_tools_settings_command(parts[2:], controller)
+        return
+
     if not subcommand or subcommand == "list":
         config = get_config()
         profiles = get_profiles()
+
+        # Summarize tool access
+        custom_rules = len(config.tool_access)
+        tool_access_summary = f"{custom_rules} custom rule(s)" if custom_rules else "Default (safe reads=allow, writes/commands=ask)"
 
         # Header panel with instructions & NVIDIA recommendation
         info_text = (
@@ -1291,7 +1738,8 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
             f"[bold bright_green]Active Base URL:[/bold bright_green] [dim]{config.openai_base_url}[/dim]\n"
             f"[bold bright_green]API Key:[/bold bright_green] [dim]{('***' + config.openai_api_key[-4:]) if config.openai_api_key else 'Not set'}[/dim]\n"
             f"[bold bright_green]Max Iterations:[/bold bright_green] [green]{config.max_iterations}[/green]  •  "
-            f"[bold bright_green]Max Tool Calls:[/bold bright_green] [green]{config.max_tool_calls}[/green]\n\n"
+            f"[bold bright_green]Max Tool Calls:[/bold bright_green] [green]{config.max_tool_calls}[/green]\n"
+            f"[bold bright_green]Tool Access:[/bold bright_green] [yellow]{tool_access_summary}[/yellow]\n\n"
             "[bold bright_yellow]★ RECOMMENDED: NVIDIA NIM Free Models ★[/bold bright_yellow]\n"
             "NVIDIA provides 1,000 free API credits with access to top-tier open models.\n"
             "• [bold]Register for free key:[/bold] [underline cyan]https://build.nvidia.com/[/underline cyan]\n"
@@ -1302,6 +1750,7 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
             "• [cyan]/provider add[/cyan]         -> Guided wizard to add any provider (NVIDIA, OpenAI, Groq...)\n"
             "• [cyan]/provider use <name>[/cyan] -> Switch active provider profile\n"
             "• [cyan]/provider list[/cyan]        -> List all saved profiles\n"
+            "• [cyan]/settings tools[/cyan]       -> Interactive tool access editor (allow / ask / deny)\n"
             "• [cyan]/settings set <name> <val>[/cyan] -> Change setting (e.g. /settings set max_iterations 1000)\n"
             "• [cyan]/settings edit[/cyan]        -> Interactive configuration editor\n"
             "• [cyan]/config[/cyan]               -> Full configuration table"
@@ -1615,18 +2064,22 @@ def tools():
     """List available tools."""
     registry = get_registry()
     tools = registry.get_all()
+    config = get_config()
 
     table = Table(title="ireri Available Tools", box=ROUNDED, border_style="bright_blue")
     table.add_column("Name", style="cyan")
     table.add_column("Description", style="white")
-    table.add_column("Approval", style="yellow")
+    table.add_column("Access Policy", style="yellow")
     table.add_column("Dangerous", style="red")
 
     for tool in tools:
+        default_p = "ask" if tool.requires_approval else "allow"
+        policy = config.get_tool_access(tool.name, default=default_p)
+        p_style = "green" if policy == "allow" else ("red" if policy == "deny" else "yellow")
         table.add_row(
             tool.name,
             tool.description,
-            "Yes" if tool.requires_approval else "No",
+            f"[{p_style}]{policy.upper()}[/{p_style}]",
             "Yes" if tool.dangerous else "No",
         )
 

@@ -495,6 +495,109 @@ async def test_run_command_captures_error_on_nonzero_exit():
     assert res.output["returncode"] == 2
 
 
+def test_config_tool_access_methods():
+    """Verify AgentConfig tool_access get/set/reset and serialization."""
+    from agent.config import AgentConfig
+
+    cfg = AgentConfig()
+    assert cfg.get_tool_access("write_file", default="ask") == "ask"
+    assert cfg.get_tool_access("read_file", default="allow") == "allow"
+
+    cfg.set_tool_access("write_file", "ALLOW")
+    cfg.set_tool_access("delete_file", "deny")
+    assert cfg.get_tool_access("write_file") == "allow"
+    assert cfg.get_tool_access("delete_file") == "deny"
+
+    with pytest.raises(ValueError, match="Invalid tool access policy"):
+        cfg.set_tool_access("write_file", "invalid_policy")
+
+    d = cfg.to_dict()
+    assert d["tool_access"] == {"write_file": "allow", "delete_file": "deny"}
+
+    restored = AgentConfig.from_dict(d)
+    assert restored.get_tool_access("write_file") == "allow"
+    assert restored.get_tool_access("delete_file") == "deny"
+
+    restored.reset_tool_access("write_file")
+    assert restored.get_tool_access("write_file", default="ask") == "ask"
+    assert restored.get_tool_access("delete_file") == "deny"
+
+    restored.reset_tool_access()
+    assert restored.tool_access == {}
+
+
+@pytest.mark.asyncio
+async def test_controller_enforces_tool_access_policies(tmp_path: Path):
+    """Verify AgentController enforces allow, ask, and deny tool_access policies."""
+    from agent.config import reset_config
+    reset_config()
+    sm = SessionManager(workspace_root=tmp_path)
+    controller = AgentController(session_manager=sm)
+    controller.config.workspace_root = tmp_path
+
+    approval_calls = []
+
+    async def mock_approval(tool_name, args, dangerous):
+        approval_calls.append(tool_name)
+        return True
+
+    controller.approval_callback = mock_approval
+
+    # 1. Deny policy blocks tool without calling approval_callback
+    controller.config.set_tool_access("read_file", "deny")
+    (tmp_path / "sample.txt").write_text("hello", encoding="utf-8")
+    res_deny = await controller._execute_tool_call({
+        "id": "c1",
+        "function": {"name": "read_file", "arguments": json.dumps({"path": "sample.txt"})},
+    })
+    assert res_deny.success is False
+    assert "denied by tool access settings" in res_deny.error
+    assert approval_calls == []
+
+    # 2. Ask policy on read_file triggers approval_callback even though requires_approval=False
+    controller.config.set_tool_access("read_file", "ask")
+    res_ask = await controller._execute_tool_call({
+        "id": "c2",
+        "function": {"name": "read_file", "arguments": json.dumps({"path": "sample.txt"})},
+    })
+    assert res_ask.success is True
+    assert approval_calls == ["read_file"]
+
+    # 3. Allow policy on write_file skips approval_callback even though requires_approval=True
+    controller.config.set_tool_access("write_file", "allow")
+    res_allow = await controller._execute_tool_call({
+        "id": "c3",
+        "function": {"name": "write_file", "arguments": json.dumps({"path": "created.txt", "content": "ok"})},
+    })
+    assert res_allow.success is True
+    assert approval_calls == ["read_file"]  # write_file did NOT prompt
+    assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "ok"
+
+
+@pytest.mark.asyncio
+async def test_handle_tools_settings_command(tmp_path: Path):
+    """Verify /settings tools subcommands update and persist tool access policies."""
+    from agent.cli import _handle_tools_settings_command
+
+    sm = SessionManager(workspace_root=tmp_path)
+    controller = AgentController(session_manager=sm)
+
+    with patch("agent.config._save_global_config") as mock_save:
+        await _handle_tools_settings_command(["write_file", "allow"], controller)
+        assert controller.config.get_tool_access("write_file") == "allow"
+        assert mock_save.call_count == 1
+
+        await _handle_tools_settings_command(["delete_file", "deny"], controller)
+        assert controller.config.get_tool_access("delete_file") == "deny"
+
+        await _handle_tools_settings_command(["write_file", "reset"], controller)
+        assert "write_file" not in controller.config.tool_access
+
+        await _handle_tools_settings_command(["reset"], controller)
+        assert controller.config.tool_access == {}
+
+
+
 
 
 
