@@ -24,6 +24,7 @@ Guidelines:
 - Report errors honestly - don't claim success without verification
 - Use the tools provided; don't simulate or fake tool execution
 - Preserve existing code style and conventions
+- For long-running processes such as bots, servers, or watchers (e.g., 'python bot.py', 'npm run dev', 'uvicorn ...'), ALWAYS pass background=true to run_command so it starts in the background and returns immediately without blocking. Use get_process_logs or list_processes to inspect ongoing process output.
 
 Safety:
 - Never execute dangerous commands without approval

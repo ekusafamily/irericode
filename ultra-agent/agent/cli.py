@@ -144,7 +144,15 @@ def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["Thi
             console.print(f"  [blue]OK[/blue] Found {count} items\n")
         elif tool == "run_command":
             if success:
-                console.print(f"  [magenta]OK[/magenta] Command completed\n")
+                if metadata.get("background") and metadata.get("process_id"):
+                    pid_str = metadata.get("pid", "?")
+                    proc_id = metadata["process_id"]
+                    console.print(
+                        f"  [magenta]OK[/magenta] Started in background ([cyan]{proc_id}[/cyan], PID {pid_str}) "
+                        f"— use [bold]/logs {proc_id}[/bold] to view logs\n"
+                    )
+                else:
+                    console.print(f"  [magenta]OK[/magenta] Command completed\n")
             else:
                 console.print(f"  [red]FAIL[/red] Command failed\n")
         elif tool == "delete_file":
@@ -853,6 +861,8 @@ async def _chat_async(
 SLASH_COMMANDS = {
     "/btw": "Ask a direct question to the model & enlighten the agent without disrupting running tasks",
     "/queue": "View, add, or clear queued tasks for upcoming runs",
+    "/logs": "View or follow live logs of an ongoing process (/logs [id|follow])",
+    "/ps": "List or stop ongoing background processes (/ps [stop <id>])",
     "/tokens": "View session tokens sent/received and approximate context length",
     "/help": "Display all available commands",
     "/provider": "Configure AI providers (NVIDIA, OpenAI, etc.)",
@@ -876,6 +886,8 @@ SLASH_COMMANDS = {
 SLASH_COMMAND_ICONS = {
     "/btw": "💡",
     "/queue": "📥",
+    "/logs": "📜",
+    "/ps": "⚙",
     "/tokens": "📊",
     "/help": "✦",
     "/provider": "⚡",
@@ -1080,6 +1092,14 @@ async def _handle_slash_command(command: str, controller: AgentController) -> No
         _show_errors_command(controller, parts)
         return True
 
+    elif cmd in ("/logs", "/log"):
+        await _handle_logs_command(parts)
+        return True
+
+    elif cmd in ("/ps", "/processes"):
+        await _handle_ps_command(parts)
+        return True
+
     elif cmd == "/reset":
         controller.reset()
         console.print(render_system_message("[green]Session reset.[/green]"))
@@ -1169,6 +1189,147 @@ def _show_errors_command(controller: AgentController, parts: list) -> None:
         f"[dim]Full error log at: [underline]{controller.session_manager.error_log_file}[/underline][/dim]"
     ))
     console.print()
+
+
+async def _handle_ps_command(parts: list) -> None:
+    """Handle /ps command - list or stop ongoing/recent processes."""
+    from agent.tools.terminal import get_process_manager
+
+    pm = get_process_manager()
+    sub = parts[1].lower() if len(parts) > 1 else ""
+
+    if sub == "stop":
+        target = parts[2] if len(parts) > 2 else ""
+        if not target:
+            console.print("[yellow]Usage: /ps stop <process_id|all>[/yellow]")
+            return
+        if target.lower() == "all":
+            count = pm.stop_all()
+            console.print(render_system_message(f"[yellow]Stopped {count} running process(es).[/yellow]"))
+            return
+        ok, msg = await pm.stop_process(target)
+        color = "green" if ok else "red"
+        console.print(render_system_message(f"[{color}]{msg}[/{color}]"))
+        return
+
+    procs = pm.list_processes()
+    if not procs:
+        console.print(render_system_message("[dim]No processes have been started in this session yet.[/dim]"))
+        return
+
+    table = Table(title="Managed Processes", box=ROUNDED, border_style="bright_blue")
+    table.add_column("ID", style="cyan", width=10)
+    table.add_column("PID", style="dim", width=8)
+    table.add_column("Status", width=14)
+    table.add_column("Mode", style="dim", width=12)
+    table.add_column("Uptime", style="dim", width=9)
+    table.add_column("Command", style="white")
+
+    for p in procs:
+        status_str = "[bold green]RUNNING[/bold green]" if p.is_running else f"[dim]EXIT ({p.returncode})[/dim]"
+        mode_str = "background" if p.background else "foreground"
+        uptime_str = f"{p.uptime_seconds:.1f}s"
+        cmd_str = p.command if len(p.command) <= 60 else p.command[:57] + "..."
+        table.add_row(p.process_id, str(p.pid or "-"), status_str, mode_str, uptime_str, cmd_str)
+
+    console.print()
+    console.print(table)
+    console.print(render_system_message(
+        "[dim]Commands: [cyan]/logs <id>[/cyan] (view logs)  •  [cyan]/logs follow <id>[/cyan] (stream live)  •  [cyan]/ps stop <id>[/cyan] (stop)[/dim]"
+    ))
+    console.print()
+
+
+async def _handle_logs_command(parts: list) -> None:
+    """Handle /logs command - view or follow live logs of an ongoing or recent process."""
+    from rich.markup import escape
+    from agent.tools.terminal import get_process_manager
+
+    pm = get_process_manager()
+    args = parts[1:]
+
+    follow = False
+    proc_id: Optional[str] = None
+    tail = 80
+
+    for arg in args:
+        low = arg.lower()
+        if low in ("follow", "-f", "--follow", "live"):
+            follow = True
+        elif arg.isdigit():
+            tail = int(arg)
+        elif not proc_id:
+            proc_id = arg
+
+    proc = pm.get_process(proc_id)
+    if not proc:
+        msg = f"Process '{proc_id}' not found." if proc_id else "No ongoing or recent processes found."
+        console.print(render_system_message(f"[yellow]{msg}[/yellow] [dim]Run /ps to list processes.[/dim]"))
+        return
+
+    status_label = "[bold green]RUNNING[/bold green]" if proc.is_running else f"[dim]EXITED ({proc.returncode})[/dim]"
+    header = (
+        f"[bold cyan]{proc.process_id}[/bold cyan] (PID {proc.pid})  •  {status_label}  •  "
+        f"[dim]Uptime: {proc.uptime_seconds:.1f}s[/dim]\n"
+        f"[dim]Command: {escape(proc.command)}[/dim]"
+    )
+
+    if not follow:
+        logs = proc.get_recent_logs(tail=tail)
+        body = escape(logs) if logs else "[dim](No output captured yet)[/dim]"
+        console.print()
+        console.print(Panel(
+            f"{header}\n\n{body}",
+            title=f"[bold bright_blue]Process Logs (last {tail} lines)[/bold bright_blue]",
+            border_style="bright_blue",
+            box=ROUNDED,
+            padding=(0, 1),
+        ))
+        if proc.is_running:
+            console.print(render_system_message(
+                f"[dim]Process is still running. Use [cyan]/logs follow {proc.process_id}[/cyan] to stream live logs or [cyan]/ps stop {proc.process_id}[/cyan] to stop.[/dim]"
+            ))
+        console.print()
+        return
+
+    # Live follow mode
+    console.print()
+    console.print(Panel(
+        f"{header}\n[dim]Streaming live logs... Press Ctrl+C to stop watching (the process will keep running).[/dim]",
+        title="[bold bright_cyan]Live Process Logs[/bold bright_cyan]",
+        border_style="bright_cyan",
+        box=ROUNDED,
+    ))
+
+    # Print existing recent lines first
+    all_lines = list(proc.combined_logs)
+    start_idx = max(0, len(all_lines) - min(tail, 30))
+    for line in all_lines[start_idx:]:
+        console.print(f"  {escape(line)}")
+    seen_total = len(all_lines)
+
+    try:
+        while True:
+            cur_lines = list(proc.combined_logs)
+            if len(cur_lines) > seen_total:
+                for line in cur_lines[seen_total:]:
+                    console.print(f"  {escape(line)}")
+                seen_total = len(cur_lines)
+            elif len(cur_lines) < seen_total:
+                # Deque wrapped around
+                seen_total = len(cur_lines)
+
+            if not proc.is_running:
+                # Flush any final lines
+                cur_lines = list(proc.combined_logs)
+                if len(cur_lines) > seen_total:
+                    for line in cur_lines[seen_total:]:
+                        console.print(f"  {escape(line)}")
+                console.print(render_system_message(f"[dim]Process {proc.process_id} exited with code {proc.returncode}.[/dim]"))
+                break
+            await asyncio.sleep(0.25)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        console.print(render_system_message(f"[yellow]Stopped watching logs for {proc.process_id} (process still {'running' if proc.is_running else 'exited'}).[/yellow]"))
 
 
 async def _handle_btw_command(question: str, controller: AgentController) -> None:

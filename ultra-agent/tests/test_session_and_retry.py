@@ -597,6 +597,73 @@ async def test_handle_tools_settings_command(tmp_path: Path):
         assert controller.config.tool_access == {}
 
 
+@pytest.mark.asyncio
+async def test_background_process_logs_and_stop():
+    """Verify background run_command returns immediately, streams live logs, and can be inspected & stopped."""
+    from agent.tools.terminal import (
+        RunCommandTool,
+        RunCommandArgs,
+        ListProcessesTool,
+        ListProcessesArgs,
+        GetProcessLogsTool,
+        GetProcessLogsArgs,
+        StopProcessTool,
+        StopProcessArgs,
+        get_process_manager,
+    )
+
+    run_tool = RunCommandTool()
+    list_tool = ListProcessesTool()
+    logs_tool = GetProcessLogsTool()
+    stop_tool = StopProcessTool()
+
+    # Start a long-running "bot" process in the background
+    bot_cmd = 'python -u -c "import time; print(\'BOT_READY\', flush=True); time.sleep(30)"'
+    res = await run_tool.execute(RunCommandArgs(command=bot_cmd, background=True, wait_seconds=0.8))
+
+    assert res.success is True
+    assert res.output["status"] == "running"
+    proc_id = res.output["process_id"]
+    assert "BOT_READY" in res.output["initial_logs"]
+
+    try:
+        # List ongoing processes
+        list_res = await list_tool.execute(ListProcessesArgs())
+        assert list_res.success is True
+        matching = [p for p in list_res.output["processes"] if p["process_id"] == proc_id]
+        assert len(matching) == 1
+        assert matching[0]["status"] == "running"
+
+        # Fetch live logs of the ongoing process
+        logs_res = await logs_tool.execute(GetProcessLogsArgs(process_id=proc_id, tail=50))
+        assert logs_res.success is True
+        assert logs_res.output["status"] == "running"
+        assert "BOT_READY" in logs_res.output["logs"]
+    finally:
+        # Stop the background process cleanly
+        stop_res = await stop_tool.execute(StopProcessArgs(process_id=proc_id))
+        assert stop_res.success is True
+
+    proc = get_process_manager().get_process(proc_id)
+    assert proc is not None
+    assert proc.is_running is False
+
+
+@pytest.mark.asyncio
+async def test_foreground_timeout_suggests_background():
+    """Verify foreground command timeout kills process tree cleanly and hints background=true."""
+    from agent.tools.terminal import RunCommandTool, RunCommandArgs
+
+    run_tool = RunCommandTool()
+    hang_cmd = 'python -u -c "import time; print(\'STARTING\', flush=True); time.sleep(30)"'
+    res = await run_tool.execute(RunCommandArgs(command=hang_cmd, timeout=1, background=False))
+
+    assert res.success is False
+    assert "background=true" in res.error
+    assert "STARTING" in res.output["partial_logs"]
+
+
+
 
 
 
