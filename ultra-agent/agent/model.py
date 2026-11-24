@@ -16,6 +16,60 @@ logger = logging.getLogger(__name__)
 # Incremental retry delays in seconds: 1s, 5s, 15s, 30s, 1m (60s), 3m (180s)
 RETRY_DELAYS = [1, 5, 15, 30, 60, 180]
 
+# Maximum time to wait for a model response before diagnosing & reloading connection (3 mins = 180s)
+MODEL_CALL_TIMEOUT = 180.0
+
+
+async def diagnose_connection(base_url: str, api_key: str, timeout: float = 8.0) -> Dict[str, Any]:
+    """Diagnose connectivity to model API endpoint to find out what the problem is."""
+    import httpx
+    import time
+    from urllib.parse import urlparse
+
+    result = {
+        "reachable": False,
+        "latency_ms": None,
+        "status_code": None,
+        "error": None,
+        "summary": "",
+    }
+
+    parsed = urlparse(base_url)
+    hostname = parsed.hostname or base_url
+
+    start = time.time()
+    try:
+        test_url = base_url.rstrip("/") + "/models"
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(test_url, headers=headers)
+            elapsed_ms = int((time.time() - start) * 1000)
+            result["reachable"] = True
+            result["latency_ms"] = elapsed_ms
+            result["status_code"] = resp.status_code
+            if resp.status_code == 200:
+                result["summary"] = f"Endpoint is reachable and responsive ({elapsed_ms}ms latency). The provider may be experiencing queue delays or high load."
+            elif resp.status_code == 401:
+                result["summary"] = f"Endpoint is reachable ({elapsed_ms}ms), but returned 401 Unauthorized (Invalid API Key)."
+            elif resp.status_code == 429:
+                result["summary"] = f"Endpoint is reachable ({elapsed_ms}ms), but rate limit (429) was exceeded."
+            else:
+                result["summary"] = f"Endpoint is reachable ({elapsed_ms}ms) but returned HTTP status {resp.status_code}."
+    except httpx.ConnectTimeout:
+        result["error"] = "ConnectTimeout"
+        result["summary"] = f"Could not connect to {hostname} within {timeout}s. Check internet connection, proxy, or firewall."
+    except httpx.ConnectError as e:
+        result["error"] = f"ConnectError: {e}"
+        result["summary"] = f"Connection failed to {hostname}. Host unreachable or offline."
+    except httpx.ReadTimeout:
+        result["error"] = "ReadTimeout"
+        result["summary"] = f"Connected to {hostname}, but server timed out without returning response headers."
+    except Exception as e:
+        result["error"] = str(e)
+        result["summary"] = f"Diagnostic probe error: {e}"
+
+    return result
+
 
 @dataclass
 class ModelResponse:
@@ -35,6 +89,7 @@ class ModelClient:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
+        timeout: float = MODEL_CALL_TIMEOUT,
     ):
         config = get_config()
 
@@ -42,6 +97,7 @@ class ModelClient:
         self.base_url = base_url or config.openai_base_url
         # Use explicitly passed model; caller handles priority resolution
         self.model = model if model is not None else config.openai_model
+        self.timeout = timeout
 
         if not self.api_key:
             raise ValueError("API key is required. Set OPENAI_API_KEY in .env")
@@ -49,10 +105,23 @@ class ModelClient:
         self.client = AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
+            timeout=self.timeout,
         )
         self.progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None
 
-        logger.info(f"Model client initialized: {self.model} @ {self.base_url}")
+        logger.info(f"Model client initialized: {self.model} @ {self.base_url} (timeout: {self.timeout}s)")
+
+    def reload_client(self) -> None:
+        """Reload and recreate the AsyncOpenAI client instance (restarts connection pool)."""
+        logger.info(f"Reloading AsyncOpenAI client connection pool for {self.model} @ {self.base_url}")
+        try:
+            self.client = AsyncOpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.timeout,
+            )
+        except Exception as e:
+            logger.error(f"Failed to reload model client: {e}")
 
     async def chat(
         self,
@@ -63,12 +132,14 @@ class ModelClient:
         max_tokens: Optional[int] = None,
         stream: bool = False,
         retry_delays: Optional[List[int]] = None,
+        request_timeout: Optional[float] = None,
         progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> ModelResponse:
-        """Send a chat completion request with incremental retry delay on error."""
+        """Send a chat completion request with incremental retry delay and 3-min timeout recovery."""
         delays = retry_delays if retry_delays is not None else RETRY_DELAYS
         cb = progress_callback or self.progress_callback
         total_attempts = len(delays) + 1
+        call_timeout = request_timeout if request_timeout is not None else self.timeout
 
         for attempt_idx in range(total_attempts):
             try:
@@ -86,11 +157,36 @@ class ModelClient:
                     if tool_choice:
                         kwargs["tool_choice"] = tool_choice
 
-                if stream:
-                    response = await self._stream_chat(**kwargs)
-                else:
-                    raw_response = await self.client.chat.completions.create(**kwargs)
-                    response = self._parse_response(raw_response)
+                try:
+                    if stream:
+                        response = await asyncio.wait_for(
+                            self._stream_chat(**kwargs),
+                            timeout=call_timeout,
+                        )
+                    else:
+                        raw_response = await asyncio.wait_for(
+                            self.client.chat.completions.create(**kwargs),
+                            timeout=call_timeout,
+                        )
+                        response = self._parse_response(raw_response)
+                except (asyncio.TimeoutError, TimeoutError):
+                    # Model did not respond within 3 minutes (or call_timeout)
+                    logger.warning(
+                        f"Model did not respond within {int(call_timeout)}s (3 mins). Diagnosing issue..."
+                    )
+                    diagnostic = await diagnose_connection(self.base_url, self.api_key)
+                    self.reload_client()
+                    if cb:
+                        cb("model_timeout", {
+                            "timeout": call_timeout,
+                            "diagnostic": diagnostic,
+                            "attempt": attempt_idx + 1,
+                            "max_attempts": len(delays),
+                        })
+                    raise TimeoutError(
+                        f"No response from model within {int(call_timeout)}s (3 mins). "
+                        f"Diagnostic: {diagnostic['summary']}"
+                    )
 
                 if attempt_idx > 0:
                     logger.info(f"Model API call recovered on retry {attempt_idx}")

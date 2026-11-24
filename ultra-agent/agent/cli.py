@@ -183,6 +183,19 @@ def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["Thi
         console.print(f"\n  [green]✓[/green] API call recovered on retry attempt {data.get('attempt')}\n")
         if thinking:
             thinking.start("[bold bright_cyan]Thinking...[/bold bright_cyan]")
+    elif event == "model_timeout":
+        if thinking:
+            thinking.stop()
+        diagnostic = data.get("diagnostic", {})
+        summary = diagnostic.get("summary", "Could not diagnose connection issue.")
+        attempt = data.get("attempt", 1)
+        max_attempts = data.get("max_attempts", 6)
+        timeout_sec = int(data.get("timeout", 180))
+        console.print(f"\n  [bold red]⚠ No response from model within {timeout_sec // 60} minutes ({timeout_sec}s).[/bold red]")
+        console.print(f"  [cyan]🔍 Diagnostic:[/cyan] [dim]{summary}[/dim]")
+        console.print(f"  [bold green]🔄 Reloaded client connection pool.[/bold green] [yellow]Retrying (attempt {attempt}/{max_attempts})...[/yellow]\n")
+        if thinking:
+            thinking.start("[bold bright_cyan]Retrying request with reloaded connection...[/bold bright_cyan]")
 
 
 class _AwaitableNone:

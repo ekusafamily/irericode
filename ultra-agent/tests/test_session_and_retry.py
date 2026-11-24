@@ -251,4 +251,60 @@ async def test_controller_btw_direct_chat_and_enlighten(tmp_path: Path):
     assert "[BTW_AGENT]" in log_text
 
 
+def test_model_call_timeout_constant():
+    """Verify default model call timeout is 180 seconds (3 minutes)."""
+    from agent.model import MODEL_CALL_TIMEOUT
+    assert MODEL_CALL_TIMEOUT == 180.0
+
+
+@pytest.mark.asyncio
+async def test_model_client_timeout_diagnosis_and_reload():
+    """Verify that when a model call hangs/times out, it diagnoses the issue, reloads the client, and emits model_timeout event."""
+    from agent.model import ModelClient
+
+    client = ModelClient(api_key="test-key", base_url="http://test.local/v1", model="test-model", timeout=0.05)
+    initial_internal_client = client.client
+
+    # Simulate hanging model call
+    async def hanging_create(**kwargs):
+        await asyncio.sleep(1.0)  # longer than 0.05s timeout
+        return MagicMock()
+
+    client.client.chat.completions.create = hanging_create
+
+    events = []
+    def callback(event, data):
+        events.append((event, data))
+
+    # Mock diagnose_connection so test doesn't make real network calls
+    with patch("agent.model.diagnose_connection", new_callable=AsyncMock) as mock_diag:
+        mock_diag.return_value = {
+            "reachable": True,
+            "latency_ms": 45,
+            "status_code": 200,
+            "error": None,
+            "summary": "Endpoint reachable and healthy (45ms). Provider under heavy load.",
+        }
+
+        with pytest.raises(TimeoutError, match="No response from model"):
+            await client.chat(
+                messages=[{"role": "user", "content": "hi"}],
+                retry_delays=[],  # fail immediately on first timeout for test
+                request_timeout=0.05,
+                progress_callback=callback,
+            )
+
+        # Verify diagnosis was called
+        mock_diag.assert_called_once_with("http://test.local/v1", "test-key")
+
+    # Verify model_timeout event was emitted
+    timeout_events = [e for e in events if e[0] == "model_timeout"]
+    assert len(timeout_events) == 1
+    assert timeout_events[0][1]["diagnostic"]["reachable"] is True
+
+    # Verify client was reloaded (re-instantiated)
+    assert client.client is not initial_internal_client
+
+
+
 
