@@ -290,6 +290,8 @@ async def _chat_async(
 
     # Initialize controller
     controller = AgentController()
+    global _current_controller
+    _current_controller = controller
     if auto_approve:
         controller.set_approve_all(True)
 
@@ -308,10 +310,13 @@ async def _chat_async(
 
     # Define approval callback for interactive mode
     async def _approval_callback(tool_name: str, args: Dict[str, Any], dangerous: bool) -> bool:
-        """Prompt user for tool approval."""
+        """Prompt user for tool approval with support for /btw and message queuing."""
+        if controller._approve_all:
+            return True
+        if controller._deny_all:
+            return False
+
         thinking.stop()
-        import asyncio
-        from rich.prompt import Prompt
         from rich.markup import escape
 
         # Format args for display
@@ -334,51 +339,17 @@ async def _chat_async(
         )
         console.print(Panel(options_text, border_style="dim", box=ROUNDED, padding=(0, 1), width=console.width - 4))
 
-        while True:
-            # Run blocking Prompt.ask in executor to avoid blocking event loop
-            loop = asyncio.get_event_loop()
-            raw_choice = await loop.run_in_executor(
-                None,
-                lambda: Prompt.ask(
-                    "[bold cyan]Approve? [y/n/a/d][/bold cyan]",
-                    default="y",
-                )
-            )
-            raw_choice = str(raw_choice).strip()
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        controller.active_approval = future
 
-            if raw_choice.lower().startswith("/btw"):
-                question = raw_choice[4:].strip()
-                if question:
-                    await _handle_btw_command(question, controller)
-                else:
-                    console.print("[yellow]Usage: /btw <question>[/yellow]")
-                continue
-
-            if raw_choice.lower().startswith("/queue"):
-                q_parts = raw_choice.split()
-                _handle_queue_command(q_parts, controller)
-                continue
-
-            choice = raw_choice.lower()
-            if choice == "a":
-                controller.set_approve_all(True)
-                console.print(render_system_message("[green]Approved all future tool calls for this session[/green]"))
-                return True
-            elif choice == "d":
-                controller.set_deny_all(True)
-                console.print(render_system_message("[red]Denied all future tool calls for this session[/red]"))
-                return False
-            elif choice in ("y", "yes"):
-                return True
-            elif choice in ("n", "no"):
-                return False
-            else:
-                # If user typed another instruction while waiting, queue it for next run!
-                q_len = controller.queue_message(raw_choice)
-                console.print(render_system_message(
-                    f"[green]✓ Queued task #{q_len}:[/green] [white]{raw_choice}[/white]\n"
-                    f"[dim]Please approve or deny the current tool call to proceed.[/dim]"
-                ))
+        try:
+            approved = await future
+            return approved
+        except asyncio.CancelledError:
+            return False
+        finally:
+            controller.active_approval = None
 
     controller.approval_callback = _approval_callback
 
@@ -394,8 +365,45 @@ async def _chat_async(
         style=SLASH_COMPLETION_STYLE,
     )
 
+    background_worker_task: Optional[asyncio.Task] = None
+
+    async def _run_task_and_drain_queue(task: str):
+        """Background worker executing tasks from the queue in sequence while prompt stays active."""
+        current_task = task
+        while current_task and not controller.cancelled:
+            try:
+                result = await controller.run_task(
+                    current_task,
+                    progress_callback=lambda event, data: _progress_callback(event, data, thinking),
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                result = f"Error during task: {e}"
+                controller.session_manager.log_error("TASK_ERROR", str(e))
+            finally:
+                thinking.stop()
+
+            # Display result on the left
+            console.print()
+            console.print(render_agent_message(result))
+
+            # Process next queued message if available
+            if controller.has_queued_messages() and not controller.cancelled:
+                current_task = controller.pop_queued_message()
+                remaining = len(controller.message_queue)
+                console.print()
+                console.print(render_system_message(
+                    f"[bold cyan]▶ Running queued task ({remaining} remaining in queue):[/bold cyan]\n"
+                    f"[white]{current_task}[/white]"
+                ))
+                console.print(render_user_message(current_task))
+            else:
+                current_task = None
+
     # Chat loop
     async def _chat_loop():
+        nonlocal background_worker_task
         while True:
             try:
                 console.print()
@@ -418,6 +426,9 @@ async def _chat_async(
                     )
 
                 if user_input.lower() in ("exit", "quit", "q"):
+                    if background_worker_task and not background_worker_task.done():
+                        controller.cancel()
+                        background_worker_task.cancel()
                     console.print()
                     console.print(render_system_message("[yellow]Goodbye from ireri![/yellow]"))
                     break
@@ -425,15 +436,97 @@ async def _chat_async(
                 if not user_input.strip():
                     continue
 
-                # Display user message on the right
-                console.print(render_user_message(user_input))
+                # Check if tool approval is currently waiting
+                if controller.active_approval and not controller.active_approval.done():
+                    cleaned = user_input.strip()
+                    if cleaned.lower().startswith("/btw"):
+                        question = cleaned[4:].strip()
+                        if question:
+                            await _handle_btw_command(question, controller)
+                        else:
+                            console.print("[yellow]Usage: /btw <question>[/yellow]")
+                        continue
 
-                # Handle slash commands
+                    if cleaned.lower().startswith("/queue"):
+                        _handle_queue_command(cleaned.split(), controller)
+                        continue
+
+                    choice = cleaned.lower()
+                    if choice == "a":
+                        controller.set_approve_all(True)
+                        console.print(render_system_message("[green]Approved all future tool calls for this session[/green]"))
+                        controller.active_approval.set_result(True)
+                        continue
+                    elif choice == "d":
+                        controller.set_deny_all(True)
+                        console.print(render_system_message("[red]Denied all future tool calls for this session[/red]"))
+                        controller.active_approval.set_result(False)
+                        continue
+                    elif choice in ("y", "yes"):
+                        controller.active_approval.set_result(True)
+                        continue
+                    elif choice in ("n", "no"):
+                        controller.active_approval.set_result(False)
+                        continue
+                    else:
+                        q_len = controller.queue_message(cleaned)
+                        console.print(render_system_message(
+                            f"[green]✓ Queued message #{q_len}:[/green] [white]{cleaned}[/white]\n"
+                            f"[dim]Please approve or deny the current tool call with [bold]y[/bold] or [bold]n[/bold].[/dim]"
+                        ))
+                        continue
+
+                # Handle /cancel command
+                if user_input.lower() in ("/cancel", "cancel"):
+                    is_working = controller.running or (background_worker_task and not background_worker_task.done())
+                    if is_working:
+                        controller.cancel()
+                        if background_worker_task:
+                            background_worker_task.cancel()
+                        if controller.active_approval and not controller.active_approval.done():
+                            controller.active_approval.cancel()
+                        thinking.stop()
+                        controller.cancelled = False
+                        console.print(render_system_message("[yellow]⚠ Task cancelled by user.[/yellow]"))
+                    else:
+                        console.print(render_system_message("[dim]No active task running to cancel.[/dim]"))
+                    continue
+
+                # Handle /btw side-chat (works both when working and when idle!)
+                if user_input.lower().startswith("/btw"):
+                    question = user_input[4:].strip()
+                    if question:
+                        await _handle_btw_command(question, controller)
+                    else:
+                        console.print("[yellow]Usage: /btw <your question or side note>[/yellow]")
+                        console.print("[dim]Example: /btw what database are we using?[/dim]")
+                    continue
+
+                # Handle /queue command
+                if user_input.lower().startswith("/queue"):
+                    _handle_queue_command(user_input.split(), controller)
+                    continue
+
+                # Handle other slash commands
                 if user_input.strip().startswith("/"):
                     should_continue = await _handle_slash_command(user_input.strip(), controller)
                     if should_continue is False:
                         break
                     continue
+
+                # If the agent is currently working on a task, queue the message!
+                is_working = controller.running or (background_worker_task and not background_worker_task.done())
+                if is_working:
+                    console.print(render_user_message(user_input))
+                    q_len = controller.queue_message(user_input)
+                    console.print(render_system_message(
+                        f"[bold cyan]📥 Message queued for next run[/bold cyan] [dim](Position #{q_len} in queue). "
+                        f"It will execute automatically when the current task finishes.[/dim]"
+                    ))
+                    continue
+
+                # Agent is idle: display user message
+                console.print(render_user_message(user_input))
 
                 # Handle conversational messages directly
                 if controller._is_conversational(user_input):
@@ -472,44 +565,31 @@ async def _chat_async(
                     console.print(render_agent_message(response))
                     continue
 
-                # Run task with progress and thinking animation, draining any queued messages
-                current_task = user_input
-                while current_task:
-                    try:
-                        result = await controller.run_task(
-                            current_task,
-                            progress_callback=lambda event, data: _progress_callback(event, data, thinking),
-                        )
-                    finally:
-                        thinking.stop()
-
-                    # Display result on the left
-                    console.print(render_agent_message(result))
-
-                    # Process next queued message if available
-                    if controller.has_queued_messages():
-                        current_task = controller.pop_queued_message()
-                        remaining = len(controller.message_queue)
-                        console.print()
-                        console.print(render_system_message(
-                            f"[bold cyan]▶ Running queued task ({remaining} remaining in queue):[/bold cyan] [white]{current_task}[/white]"
-                        ))
-                        console.print(render_user_message(current_task))
-                    else:
-                        current_task = None
+                # Launch task in background and KEEP THE INPUT PROMPT VISIBLE!
+                background_worker_task = asyncio.create_task(_run_task_and_drain_queue(user_input))
 
             except (typer.Exit, SystemExit):
                 break
             except KeyboardInterrupt:
                 console.print()
-                console.print(render_system_message("[yellow]⚠ Task interrupted — returning to prompt.[/yellow]"))
-                thinking.stop()
-                controller.cancel()
-                # Reset controller state so next task works
-                controller.cancelled = False
-                # Log the interruption and save session
-                controller.session_manager.log_error("USER_INTERRUPT", "Task cancelled by Ctrl+C")
-                controller.save_session()
+                is_working = controller.running or (background_worker_task and not background_worker_task.done())
+                if is_working:
+                    thinking.stop()
+                    controller.cancel()
+                    if background_worker_task:
+                        background_worker_task.cancel()
+                    if controller.active_approval and not controller.active_approval.done():
+                        controller.active_approval.cancel()
+                    controller.cancelled = False
+                    controller.session_manager.log_error("USER_INTERRUPT", "Task cancelled by Ctrl+C")
+                    controller.save_session()
+                    console.print(render_system_message("[yellow]⚠ Task interrupted — returning to prompt.[/yellow]"))
+                    if controller.has_queued_messages():
+                        console.print(render_system_message(
+                            f"[dim]Note: {len(controller.message_queue)} queued message(s) preserved. Type '/queue' to view or '/queue clear' to remove.[/dim]"
+                        ))
+                else:
+                    console.print(render_system_message("[dim]Type 'exit' or '/exit' to leave.[/dim]"))
             except EOFError:
                 break
             except Exception as e:
@@ -604,8 +684,11 @@ class SlashCommandCompleter(Completer):
                     )
 
 
+_current_controller: Optional[AgentController] = None
+
+
 def _get_dynamic_prompt():
-    """Show clean prompt when idle, and 'You: ' dynamically once the user begins typing."""
+    """Show clean prompt when idle, [working] when busy, and 'You: ' dynamically once the user begins typing."""
     from prompt_toolkit.application.current import get_app
     try:
         app = get_app()
@@ -613,6 +696,11 @@ def _get_dynamic_prompt():
             return HTML("<ansicyan><b>You: </b></ansicyan>")
     except Exception:
         pass
+    if _current_controller:
+        if _current_controller.active_approval and not _current_controller.active_approval.done():
+            return HTML("<ansiyellow><b>Approve? [y/n/a/d] (or /btw) ❯ </b></ansiyellow>")
+        if _current_controller.running:
+            return HTML("<ansiyellow><b>[working] ❯ </b></ansiyellow>")
     return HTML("<ansicyan><b>❯ </b></ansicyan>")
 
 
@@ -656,6 +744,11 @@ def _get_input_with_readline() -> str:
         readline.parse_and_bind('"?": complete')
     except ImportError:
         pass
+    if _current_controller:
+        if _current_controller.active_approval and not _current_controller.active_approval.done():
+            return input("\x1b[1;33mApprove? [y/n/a/d] (or /btw) ❯\x1b[0m ")
+        if _current_controller.running:
+            return input("\x1b[1;33m[working] ❯\x1b[0m ")
     return input("\x1b[1;36m❯\x1b[0m ")
 
 
