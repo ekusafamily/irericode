@@ -152,3 +152,4 @@ class SessionManager:
         # Filter for user and assistant messages for readable history
         readable = [m for m in msgs if m.get("role") in ("user", "assistant") and m.get("content")]
         return readable[-limit:]
+

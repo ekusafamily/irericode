@@ -161,3 +161,4 @@ def test_controller_session_integration(tmp_path: Path):
     # Reset should clear session
     new_controller.reset()
     assert not sm.has_saved_session()
+

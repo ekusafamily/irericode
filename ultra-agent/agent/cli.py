@@ -348,6 +348,7 @@ async def _chat_async(
         completer=pt_completer,
         complete_while_typing=True,
         complete_style=CompleteStyle.COLUMN,
+        style=SLASH_COMPLETION_STYLE,
     )
 
     # Chat loop
@@ -362,6 +363,7 @@ async def _chat_async(
                         completer=pt_completer,
                         complete_while_typing=True,
                         complete_style=CompleteStyle.COLUMN,
+                        style=SLASH_COMPLETION_STYLE,
                     )
                 except (EOFError, KeyboardInterrupt):
                     raise
@@ -474,22 +476,62 @@ SLASH_COMMANDS = {
     "/exit": "Exit the agent",
 }
 
+# Command icons for auto-completion display
+SLASH_COMMAND_ICONS = {
+    "/help": "✦",
+    "/provider": "⚡",
+    "/settings": "⚙",
+    "/model": "◈",
+    "/models": "≡",
+    "/status": "●",
+    "/config": "⚙",
+    "/history": "◷",
+    "/continue": "▶",
+    "/clear": "✕",
+    "/reset": "↺",
+    "/version": "◆",
+    "/update": "▲",
+    "/about": "ℹ",
+    "/exit": "⏻",
+}
+
 # Extract just command names for completion
 SLASH_COMMAND_NAMES = list(SLASH_COMMANDS.keys())
 
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.styles import Style
+
+# Modern styled theme for slash command auto-completion popup
+SLASH_COMPLETION_STYLE = Style.from_dict({
+    # Completion menu popup container
+    "completion-menu": "bg:#16161e #c0caf5",
+    "completion-menu.completion": "bg:#1e2030 #7aa2f7 bold",
+    "completion-menu.completion.current": "bg:#283457 #7dcfff bold",
+    "completion-menu.meta.completion": "bg:#16161e #787c99",
+    "completion-menu.meta.completion.current": "bg:#283457 #e0af68 bold",
+    "completion-menu.multi-column-meta": "bg:#16161e #787c99",
+    # Scrollbar
+    "scrollbar.background": "bg:#16161e",
+    "scrollbar.button": "bg:#3b4261",
+})
 
 
 class SlashCommandCompleter(Completer):
-    """Auto-completion for slash commands in prompt_toolkit."""
+    """Auto-completion for slash commands with icons and stylish formatting."""
 
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
         if text.startswith("/"):
             for cmd, desc in SLASH_COMMANDS.items():
                 if cmd.startswith(text):
-                    yield Completion(cmd, start_position=-len(text), display_meta=desc)
+                    icon = SLASH_COMMAND_ICONS.get(cmd, "✦")
+                    yield Completion(
+                        cmd,
+                        start_position=-len(text),
+                        display=f"{icon} {cmd:<11}",
+                        display_meta=f"  {desc}",
+                    )
 
 
 def _get_dynamic_prompt():
