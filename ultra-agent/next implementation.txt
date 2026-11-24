@@ -1,2 +1,3 @@
 global installation and maybe rust
 logs of errors for debugging
+new user ease to use it new install add api key synchrinazisation , 
