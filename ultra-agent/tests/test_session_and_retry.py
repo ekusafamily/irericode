@@ -2,6 +2,7 @@
 
 import pytest
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
 
@@ -393,6 +394,106 @@ async def test_controller_token_tracking_and_status(tmp_path: Path):
     assert status2["tokens_up"] == 170
     assert status2["tokens_down"] == 40
     assert status2["total_tokens"] == 210
+
+
+@pytest.mark.asyncio
+async def test_tool_error_sent_to_model_for_automatic_action(tmp_path: Path):
+    """Verify that when a tool encounters an error, full diagnostic error details and automatic action instructions are sent to the model."""
+    sm = SessionManager(workspace_root=tmp_path)
+    controller = AgentController(session_manager=sm)
+
+    # First turn: model calls read_file on non-existent file
+    tool_call = {
+        "id": "call_123",
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "arguments": json.dumps({"path": "missing_file.py"}),
+        },
+    }
+    resp1 = ModelResponse(
+        content=None,
+        tool_calls=[tool_call],
+        usage={"prompt_tokens": 100, "completion_tokens": 20},
+    )
+
+    # Second turn: model receives error and takes corrective action
+    resp2 = ModelResponse(
+        content="The file was missing, so I created it and resolved the issue.",
+        usage={"prompt_tokens": 150, "completion_tokens": 30},
+    )
+
+    controller.model_client.chat = AsyncMock(side_effect=[resp1, resp2])
+
+    result = await controller.run_task("Inspect missing_file.py")
+    assert "The file was missing" in result
+
+    # Verify that the tool result in context contained the error and automatic action directive
+    tool_messages = [m for m in controller.context.messages if m.role == "tool"]
+    assert len(tool_messages) == 1
+    content = tool_messages[0].content
+    assert "[TOOL ERROR in read_file]" in content
+    assert "File does not exist: missing_file.py" in content
+    assert "AUTOMATIC ACTION REQUIRED" in content
+    assert "take appropriate corrective actions automatically" in content
+
+    # Verify error was logged in session manager error log
+    assert sm.error_log_file.exists()
+    error_content = sm.error_log_file.read_text(encoding="utf-8")
+    assert "[TOOL_ERROR]" in error_content
+    assert "missing_file.py" in error_content
+
+
+@pytest.mark.asyncio
+async def test_controller_recover_from_error_automatically(tmp_path: Path):
+    """Verify that controller.recover_from_error sends the error to the model with an automatic action recovery prompt."""
+    sm = SessionManager(workspace_root=tmp_path)
+    controller = AgentController(session_manager=sm)
+
+    mock_resp = ModelResponse(
+        content="I analyzed the connection error, started the local fallback service, and the issue is resolved and done.",
+        usage={"prompt_tokens": 80, "completion_tokens": 25},
+    )
+    controller.model_client.chat = AsyncMock(return_value=mock_resp)
+
+    events = []
+    def callback(event, data):
+        events.append((event, data))
+
+    error_text = "ConnectionRefusedError: [Errno 111] Connection refused on localhost:5432"
+    result = await controller.recover_from_error(error_text, progress_callback=callback)
+
+    assert "analyzed the connection error" in result
+
+    # Check that error_encountered was emitted
+    error_events = [e for e in events if e[0] == "error_encountered"]
+    assert len(error_events) == 1
+    assert error_events[0][1]["error"] == error_text
+
+    # Verify error recovery prompt in context
+    user_msgs = [m for m in controller.context.messages if m.role == "user"]
+    assert any("An error was encountered during execution" in m.content and error_text in m.content for m in user_msgs)
+    assert any("take appropriate corrective actions" in m.content for m in user_msgs)
+
+    # Verify logged to error.log
+    assert sm.error_log_file.exists()
+    log_text = sm.error_log_file.read_text(encoding="utf-8")
+    assert "[AUTO_RECOVERY]" in log_text
+    assert "ConnectionRefusedError" in log_text
+
+
+@pytest.mark.asyncio
+async def test_run_command_captures_error_on_nonzero_exit():
+    """Verify that RunCommandTool captures failure output in error when command returns non-zero exit code."""
+    from agent.tools.terminal import RunCommandTool, RunCommandArgs
+    tool = RunCommandTool()
+
+    # Run a command that fails
+    res = await tool.execute(RunCommandArgs(command="python -c \"import sys; sys.stderr.write('fatal crash'); sys.exit(2)\""))
+    assert res.success is False
+    assert "fatal crash" in res.error
+    assert res.output["returncode"] == 2
+
 
 
 

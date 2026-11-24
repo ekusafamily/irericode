@@ -142,6 +142,10 @@ class RunCommandTool(Tool):
             stdout_text = stdout.decode("utf-8", errors="replace")
             stderr_text = stderr.decode("utf-8", errors="replace")
 
+            error_msg = None
+            if process.returncode != 0:
+                error_msg = stderr_text.strip() or stdout_text.strip() or f"Command '{args.command}' failed with exit code {process.returncode}"
+
             return ToolResult(
                 success=process.returncode == 0,
                 output={
@@ -150,7 +154,7 @@ class RunCommandTool(Tool):
                     "returncode": process.returncode,
                     "command": args.command,
                 },
-                error=stderr_text if process.returncode != 0 else None,
+                error=error_msg,
                 metadata={
                     "returncode": process.returncode,
                     "cwd": str(cwd),

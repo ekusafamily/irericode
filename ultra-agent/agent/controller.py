@@ -145,6 +145,37 @@ class AgentController:
             self.context.reset_iteration_count()
             self.save_session()
 
+    async def recover_from_error(
+        self,
+        error: str,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> str:
+        """Send an encountered error to the model automatically so it can take corrective actions."""
+        self.running = True
+        self.cancelled = False
+        if progress_callback:
+            self.progress_callback = progress_callback
+            self.model_client.progress_callback = progress_callback
+
+        self.last_error = error
+        self.session_manager.log_error("AUTO_RECOVERY", error)
+        if self.progress_callback:
+            self.progress_callback("error_encountered", {"error": error})
+
+        # Add error recovery prompt directly to context
+        prompt = get_error_recovery_prompt(error)
+        self.context.add_user_message(prompt)
+
+        try:
+            result = await self._agent_loop()
+            self.session_manager.log_message("AGENT", result)
+            self.save_session()
+            return result
+        finally:
+            self.running = False
+            self.context.reset_iteration_count()
+            self.save_session()
+
     async def _agent_loop(self) -> str:
         """Main agent loop."""
         config = self.config
@@ -170,130 +201,171 @@ class AgentController:
                     "max_iterations": max_iterations,
                 })
 
-            # Get messages for model
-            messages = self.context.get_messages_for_model()
-
-            # Get tool definitions
-            tools = self.tool_registry.get_definitions()
-
-            # Call model
             try:
-                response = await self.model_client.chat(
-                    messages=messages,
-                    tools=tools,
-                    tool_choice="auto",
-                    temperature=0.1,
-                    progress_callback=self.progress_callback,
-                )
+                # Get messages for model
+                messages = self.context.get_messages_for_model()
+
+                # Get tool definitions
+                tools = self.tool_registry.get_definitions()
+
+                # Call model
+                try:
+                    response = await self.model_client.chat(
+                        messages=messages,
+                        tools=tools,
+                        tool_choice="auto",
+                        temperature=0.1,
+                        progress_callback=self.progress_callback,
+                    )
+                except Exception as e:
+                    logger.error(f"Model call failed: {e}")
+                    self.last_error = str(e)
+                    self.session_manager.log_error(
+                        "MODEL_ERROR",
+                        str(e),
+                        {"model": self.model_client.model, "iteration": iteration},
+                    )
+                    if self.progress_callback:
+                        self.progress_callback("model_error", {"error": str(e)})
+                    # Try to recover by sending error to model
+                    error_prompt = get_error_recovery_prompt(str(e))
+                    self.context.add_user_message(error_prompt)
+                    continue
+
+                # Track token usage from model response
+                p_tokens = 0
+                c_tokens = 0
+                if response.usage:
+                    p_tokens = response.usage.get("prompt_tokens", 0) or 0
+                    c_tokens = response.usage.get("completion_tokens", 0) or 0
+                if not p_tokens:
+                    p_tokens = self.context.estimate_tokens()
+                if not c_tokens and response.content:
+                    c_tokens = max(1, len(response.content) // 4)
+
+                self.context.add_token_usage(p_tokens, c_tokens)
+
+                logger.info(f"Model response: tokens=(↑{p_tokens}, ↓{c_tokens}), content={response.content[:100] if response.content else None}, tool_calls={len(response.tool_calls) if response.tool_calls else 0}")
+
+                # Emit progress: model response with tokens up/down and approx context
+                if self.progress_callback:
+                    self.progress_callback("model_response", {
+                        "has_content": bool(response.content),
+                        "tool_calls_count": len(response.tool_calls) if response.tool_calls else 0,
+                        "finish_reason": response.finish_reason,
+                        "tokens_up": p_tokens,
+                        "tokens_down": c_tokens,
+                        "total_tokens_up": self.context.total_prompt_tokens,
+                        "total_tokens_down": self.context.total_completion_tokens,
+                        "approx_context_tokens": self.context.estimate_tokens(),
+                    })
+
+                # Handle response
+                if response.tool_calls:
+                    # Add assistant message with tool calls
+                    self.context.add_assistant_message(
+                        content=response.content,
+                        tool_calls=response.tool_calls,
+                    )
+
+                    # Execute tool calls
+                    for tool_call in response.tool_calls:
+                        if self.cancelled:
+                            break
+
+                        result = await self._execute_tool_call(tool_call)
+
+                        # Extract tool args for logging
+                        args_data = tool_call.get("function", {}).get("arguments")
+                        if isinstance(args_data, str):
+                            try:
+                                args_data = json.loads(args_data)
+                            except Exception:
+                                pass
+
+                        # Check if tool failed and prepare content
+                        if not result.success:
+                            self.last_error = result.error or "Tool execution failed"
+                            self.session_manager.log_error(
+                                "TOOL_ERROR",
+                                self.last_error,
+                                {
+                                    "tool": tool_call["function"]["name"],
+                                    "args": args_data if isinstance(args_data, dict) else {},
+                                },
+                            )
+                            logger.warning(f"Tool {tool_call['function']['name']} failed: {result.error}")
+
+                            # Build comprehensive error report so the model can take appropriate corrective actions
+                            diag_parts = [f"[TOOL ERROR in {tool_call['function']['name']}]: {self.last_error}"]
+                            if isinstance(result.output, dict):
+                                if result.output.get("stdout") and result.output.get("stdout").strip() != self.last_error.strip():
+                                    diag_parts.append(f"Command stdout:\n{result.output['stdout'].strip()}")
+                                if result.output.get("stderr") and result.output.get("stderr").strip() != self.last_error.strip():
+                                    diag_parts.append(f"Command stderr:\n{result.output['stderr'].strip()}")
+                                if "returncode" in result.output and result.output["returncode"] != 0:
+                                    diag_parts.append(f"Exit code: {result.output['returncode']}")
+                            elif result.output:
+                                diag_parts.append(f"Output: {result.output}")
+
+                            diag_parts.append(
+                                "AUTOMATIC ACTION REQUIRED: An error occurred during this action. "
+                                "Analyze this error, identify the root cause, and take appropriate corrective actions "
+                                "automatically (e.g. fix parameters, correct code syntax/logic, inspect files, or try an alternative approach)."
+                            )
+                            tool_out_str = "\n\n".join(diag_parts)
+                        else:
+                            tool_out_str = json.dumps(result.output) if isinstance(result.output, (dict, list)) else str(result.output)
+
+                        # Add tool result to context
+                        self.context.add_tool_result(
+                            tool_call_id=tool_call["id"],
+                            name=tool_call["function"]["name"],
+                            content=tool_out_str,
+                        )
+
+                        # Log tool call to history
+                        self.session_manager.log_message(
+                            "TOOL_CALL",
+                            content=tool_out_str,
+                            tool_name=tool_call["function"]["name"],
+                            tool_args=args_data if isinstance(args_data, dict) else {},
+                        )
+
+                    self.save_session()
+
+                elif response.content:
+                    # Regular response - add to context and continue
+                    self.context.add_assistant_message(content=response.content)
+
+                    # Check if task seems complete
+                    if self._is_task_complete(response.content):
+                        return response.content
+
+                    # Continue with continuation prompt
+                    self.context.add_user_message(get_continuation_prompt())
+                else:
+                    # Empty response
+                    logger.warning("Empty response from model")
+                    self.context.add_user_message(get_continuation_prompt())
+
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                logger.error(f"Model call failed: {e}")
+                logger.error(f"Error in agent iteration {iteration}: {e}")
                 self.last_error = str(e)
                 self.session_manager.log_error(
-                    "MODEL_ERROR",
+                    "ITERATION_ERROR",
                     str(e),
-                    {"model": self.model_client.model, "iteration": iteration},
+                    {"iteration": iteration},
                 )
                 if self.progress_callback:
-                    self.progress_callback("model_error", {"error": str(e)})
-                # Try to recover
-                error_prompt = get_error_recovery_prompt(str(e))
+                    self.progress_callback("error_encountered", {"error": str(e), "iteration": iteration})
+
+                # Automatically send error to model for recovery
+                error_prompt = get_error_recovery_prompt(f"Runtime execution error: {e}")
                 self.context.add_user_message(error_prompt)
                 continue
-
-            # Track token usage from model response
-            p_tokens = 0
-            c_tokens = 0
-            if response.usage:
-                p_tokens = response.usage.get("prompt_tokens", 0) or 0
-                c_tokens = response.usage.get("completion_tokens", 0) or 0
-            if not p_tokens:
-                p_tokens = self.context.estimate_tokens()
-            if not c_tokens and response.content:
-                c_tokens = max(1, len(response.content) // 4)
-
-            self.context.add_token_usage(p_tokens, c_tokens)
-
-            logger.info(f"Model response: tokens=(↑{p_tokens}, ↓{c_tokens}), content={response.content[:100] if response.content else None}, tool_calls={len(response.tool_calls) if response.tool_calls else 0}")
-
-            # Emit progress: model response with tokens up/down and approx context
-            if self.progress_callback:
-                self.progress_callback("model_response", {
-                    "has_content": bool(response.content),
-                    "tool_calls_count": len(response.tool_calls) if response.tool_calls else 0,
-                    "finish_reason": response.finish_reason,
-                    "tokens_up": p_tokens,
-                    "tokens_down": c_tokens,
-                    "total_tokens_up": self.context.total_prompt_tokens,
-                    "total_tokens_down": self.context.total_completion_tokens,
-                    "approx_context_tokens": self.context.estimate_tokens(),
-                })
-
-            # Handle response
-            if response.tool_calls:
-                # Add assistant message with tool calls
-                self.context.add_assistant_message(
-                    content=response.content,
-                    tool_calls=response.tool_calls,
-                )
-
-                # Execute tool calls
-                for tool_call in response.tool_calls:
-                    if self.cancelled:
-                        break
-
-                    result = await self._execute_tool_call(tool_call)
-
-                    # Add tool result to context
-                    tool_out_str = json.dumps(result.output) if result.success else result.error or "Tool failed"
-                    self.context.add_tool_result(
-                        tool_call_id=tool_call["id"],
-                        name=tool_call["function"]["name"],
-                        content=tool_out_str,
-                    )
-
-                    # Log tool call to history
-                    args_data = tool_call.get("function", {}).get("arguments")
-                    if isinstance(args_data, str):
-                        try:
-                            args_data = json.loads(args_data)
-                        except Exception:
-                            pass
-                    self.session_manager.log_message(
-                        "TOOL_CALL",
-                        content=tool_out_str,
-                        tool_name=tool_call["function"]["name"],
-                        tool_args=args_data if isinstance(args_data, dict) else {},
-                    )
-
-                    # Check if tool failed
-                    if not result.success:
-                        self.last_error = result.error
-                        self.session_manager.log_error(
-                            "TOOL_ERROR",
-                            result.error or "Tool failed",
-                            {
-                                "tool": tool_call["function"]["name"],
-                                "args": args_data if isinstance(args_data, dict) else {},
-                            },
-                        )
-                        logger.warning(f"Tool {tool_call['function']['name']} failed: {result.error}")
-
-                self.save_session()
-
-            elif response.content:
-                # Regular response - add to context and continue
-                self.context.add_assistant_message(content=response.content)
-
-                # Check if task seems complete
-                if self._is_task_complete(response.content):
-                    return response.content
-
-                # Continue with continuation prompt
-                self.context.add_user_message(get_continuation_prompt())
-            else:
-                # Empty response
-                logger.warning("Empty response from model")
-                self.context.add_user_message(get_continuation_prompt())
 
         if self.cancelled:
             return "Task cancelled by user"
@@ -409,6 +481,8 @@ class AgentController:
             "is complete",
             "has been completed",
             "complete.",
+            "resolved",
+            "fixed",
         ]
         response_lower = response.lower()
         return any(indicator in response_lower for indicator in completion_indicators)

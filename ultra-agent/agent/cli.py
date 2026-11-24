@@ -202,6 +202,14 @@ def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["Thi
         console.print(f"  [bold green]🔄 Reloaded client connection pool.[/bold green] [yellow]Retrying (attempt {attempt}/{max_attempts})...[/yellow]\n")
         if thinking:
             thinking.start("[bold bright_cyan]Retrying request with reloaded connection...[/bold bright_cyan]")
+    elif event == "error_encountered":
+        if thinking:
+            thinking.stop()
+        err = data.get("error", "Unknown error")
+        console.print(f"\n  [bold yellow]⚠ Error encountered:[/bold yellow] [yellow]{err}[/yellow]")
+        console.print(f"  [cyan]↳ Automatically sent to model for analysis and corrective action...[/cyan]\n")
+        if thinking:
+            thinking.start("[bold bright_cyan]Model analyzing error and taking corrective action...[/bold bright_cyan]")
 
 
 class _AwaitableNone:
@@ -385,8 +393,23 @@ async def _chat_async(
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                result = f"Error during task: {e}"
                 controller.session_manager.log_error("TASK_ERROR", str(e))
+                if not controller.cancelled:
+                    console.print()
+                    console.print(render_system_message(
+                        f"[yellow]⚠ Error encountered: {e}[/yellow]\n"
+                        f"[cyan]→ Sending error to model for automatic corrective actions...[/cyan]"
+                    ))
+                    try:
+                        thinking.start("[bold bright_cyan]Model taking corrective actions...[/bold bright_cyan]")
+                        result = await controller.recover_from_error(
+                            error=str(e),
+                            progress_callback=lambda event, data: _progress_callback(event, data, thinking),
+                        )
+                    except Exception as recovery_err:
+                        result = f"Error during task: {e}\nAutomatic recovery failed: {recovery_err}"
+                else:
+                    result = "Task cancelled by user"
             finally:
                 thinking.stop()
 

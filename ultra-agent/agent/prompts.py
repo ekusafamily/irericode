@@ -49,14 +49,15 @@ Please start by exploring the project to understand the codebase, then implement
 CONTINUATION_PROMPT = """Continue working on the task. Use the available tools to make progress. If you've completed the task, provide a summary of what was done."""
 
 
-ERROR_RECOVERY_PROMPT = """The previous action resulted in an error:
+ERROR_RECOVERY_PROMPT = """An error was encountered during execution:
 
 {error}
 
-Please analyze the error and either:
-1. Fix the issue and retry
-2. Try a different approach
-3. Ask for clarification if needed"""
+Please automatically analyze this error and take appropriate corrective actions:
+1. Determine the root cause of the error.
+2. Apply the necessary fix or corrective measures using your available tools.
+3. If an alternative approach or parameter adjustment is needed, proceed with it automatically.
+4. Report the corrective action taken and verify the resolution."""
 
 
 APPROVAL_REQUEST_PROMPT = """The following action requires your approval:
