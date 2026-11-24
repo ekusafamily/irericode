@@ -182,6 +182,11 @@ class AgentController:
             except Exception as e:
                 logger.error(f"Model call failed: {e}")
                 self.last_error = str(e)
+                self.session_manager.log_error(
+                    "MODEL_ERROR",
+                    str(e),
+                    {"model": self.model_client.model, "iteration": iteration},
+                )
                 if self.progress_callback:
                     self.progress_callback("model_error", {"error": str(e)})
                 # Try to recover
@@ -239,6 +244,14 @@ class AgentController:
                     # Check if tool failed
                     if not result.success:
                         self.last_error = result.error
+                        self.session_manager.log_error(
+                            "TOOL_ERROR",
+                            result.error or "Tool failed",
+                            {
+                                "tool": tool_call["function"]["name"],
+                                "args": args_data if isinstance(args_data, dict) else {},
+                            },
+                        )
                         logger.warning(f"Tool {tool_call['function']['name']} failed: {result.error}")
 
                 self.save_session()
@@ -325,6 +338,11 @@ class AgentController:
             return result
         except Exception as e:
             logger.error(f"Tool {tool_name} execution error: {e}")
+            self.session_manager.log_error(
+                "TOOL_EXCEPTION",
+                str(e),
+                {"tool": tool_name, "args": args_dict},
+            )
             if self.progress_callback:
                 self.progress_callback("tool_error", {
                     "tool": tool_name,

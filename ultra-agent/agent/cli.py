@@ -87,12 +87,13 @@ def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["Thi
         if thinking:
             thinking.stop()
         if data.get("tool_calls_count", 0) > 0:
-            console.print(f"  [cyan]Model: Planning {data['tool_calls_count']} tool call(s)[/cyan]")
+            console.print(f"\n  [cyan]Model: Planning {data['tool_calls_count']} tool call(s)[/cyan]")
         elif data.get("has_content"):
-            console.print("  [cyan]Model: Responding...[/cyan]")
+            console.print("\n  [cyan]Model: Responding...[/cyan]")
     elif event == "tool_start":
         if thinking:
             thinking.stop()
+        console.print()  # spacing before tool action
         tool = data["tool"]
         args = data.get("args", {})
         if tool == "write_file":
@@ -163,7 +164,7 @@ def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["Thi
     elif event == "model_error":
         if thinking:
             thinking.stop()
-        console.print(f"  [red]Model error:[/red] {data.get('error', 'unknown')}\n")
+        console.print(f"\n  [red]Model error:[/red] {data.get('error', 'unknown')}\n")
     elif event == "model_retry":
         if thinking:
             thinking.stop()
@@ -172,14 +173,14 @@ def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["Thi
         delay = data.get("delay", 1)
         err = data.get("error", "Error")
         delay_str = f"{delay // 60}m" if delay >= 60 else f"{delay}s"
-        console.print(f"  [yellow]API error: {err}[/yellow]")
-        console.print(f"  [yellow]Retrying in {delay_str} (attempt {attempt}/{max_attempts})...[/yellow]\n")
+        console.print(f"\n  [yellow]⚠ API error: {err}[/yellow]")
+        console.print(f"  [yellow]  Retrying in {delay_str} (attempt {attempt}/{max_attempts})...[/yellow]\n")
         if thinking:
             thinking.start(f"[bold bright_cyan]Waiting {delay_str} before retry ({attempt}/{max_attempts})...[/bold bright_cyan]")
     elif event == "model_retry_success":
         if thinking:
             thinking.stop()
-        console.print(f"  [green]OK[/green] API call recovered on retry attempt {data.get('attempt')}\n")
+        console.print(f"\n  [green]✓[/green] API call recovered on retry attempt {data.get('attempt')}\n")
         if thinking:
             thinking.start("[bold bright_cyan]Thinking...[/bold bright_cyan]")
 
@@ -308,8 +309,17 @@ async def _chat_async(
         # Build prompt message
         danger_indicator = " [red]! DANGEROUS[/red]" if dangerous else ""
         console.print()
-        console.print(render_system_message(f"[yellow]Approval required:[/yellow] {escape(tool_name)}({escape(args_display)}){danger_indicator}"))
-        console.print(render_system_message("[dim]Options: [bold]y[/bold]=approve  [bold]n[/bold]=deny  [bold]a[/bold]=approve all  [bold]d[/bold]=deny all[/dim]"))
+        # Use console.print directly for proper Rich markup rendering
+        approval_text = Text.from_markup(
+            f"[yellow]Approval required:[/yellow] {escape(tool_name)}({escape(args_display)}){danger_indicator}",
+            justify="center",
+        )
+        console.print(Panel(approval_text, border_style="dim", box=ROUNDED, padding=(0, 1), width=console.width - 4))
+        options_text = Text.from_markup(
+            "Options: [bold]y[/bold]=approve  [bold]n[/bold]=deny  [bold]a[/bold]=approve all  [bold]d[/bold]=deny all",
+            justify="center",
+        )
+        console.print(Panel(options_text, border_style="dim", box=ROUNDED, padding=(0, 1), width=console.width - 4))
 
         # Run blocking Prompt.ask in executor to avoid blocking event loop
         loop = asyncio.get_event_loop()
@@ -445,13 +455,20 @@ async def _chat_async(
                 break
             except KeyboardInterrupt:
                 console.print()
-                console.print(render_system_message("[yellow]Interrupted[/yellow]"))
+                console.print(render_system_message("[yellow]⚠ Task interrupted — returning to prompt.[/yellow]"))
+                thinking.stop()
                 controller.cancel()
+                # Reset controller state so next task works
+                controller.cancelled = False
+                # Log the interruption and save session
+                controller.session_manager.log_error("USER_INTERRUPT", "Task cancelled by Ctrl+C")
+                controller.save_session()
             except EOFError:
                 break
             except Exception as e:
                 console.print()
                 console.print(render_system_message(f"[red]Error: {e}[/red]"))
+                controller.session_manager.log_error("CHAT_ERROR", str(e))
 
     # Run the async chat loop
     await _chat_loop()
@@ -468,6 +485,7 @@ SLASH_COMMANDS = {
     "/config": "View, set or edit configuration (e.g. /config set max_iterations 1000)",
     "/history": "View conversation history and past messages",
     "/continue": "Continue previous conversation session",
+    "/errors": "View recent errors from debug log",
     "/clear": "Clear terminal conversation",
     "/reset": "Reset current session",
     "/version": "Show agent version",
@@ -487,6 +505,7 @@ SLASH_COMMAND_ICONS = {
     "/config": "⚙",
     "/history": "◷",
     "/continue": "▶",
+    "/errors": "⚠",
     "/clear": "✕",
     "/reset": "↺",
     "/version": "◆",
@@ -645,6 +664,10 @@ async def _handle_slash_command(command: str, controller: AgentController) -> No
         console.clear()
         return True
 
+    elif cmd == "/errors":
+        _show_errors_command(controller, parts)
+        return True
+
     elif cmd == "/reset":
         controller.reset()
         console.print(render_system_message("[green]Session reset.[/green]"))
@@ -697,6 +720,41 @@ def _show_history_command(controller: AgentController, parts: list) -> None:
     console.print(table)
     console.print(render_system_message(
         f"[dim]Full transcript logged at: [underline]{controller.session_manager.history_file}[/underline][/dim]"
+    ))
+    console.print()
+
+
+def _show_errors_command(controller: AgentController, parts: list) -> None:
+    """Handle /errors command - display recent errors from .ireri/errors.log."""
+    limit = 10
+    if len(parts) > 1:
+        try:
+            limit = int(parts[1])
+        except ValueError:
+            pass
+
+    errors = controller.session_manager.get_recent_errors(limit=limit)
+    if not errors:
+        console.print(render_system_message(
+            f"[dim]No errors encountered yet in: [underline]{controller.session_manager.error_log_file}[/underline][/dim]"
+        ))
+        return
+
+    table = Table(title=f"Recent Errors (Last {len(errors)} entries)", box=ROUNDED, border_style="red")
+    table.add_column("Timestamp", style="dim", width=19)
+    table.add_column("Type", style="bold red", width=16)
+    table.add_column("Message", style="white")
+
+    for err in errors:
+        msg = err.get("message", "").strip().replace("\n", " ")
+        if len(msg) > 80:
+            msg = msg[:77] + "..."
+        table.add_row(err.get("timestamp", ""), err.get("type", "ERROR"), msg)
+
+    console.print()
+    console.print(table)
+    console.print(render_system_message(
+        f"[dim]Full error log at: [underline]{controller.session_manager.error_log_file}[/underline][/dim]"
     ))
     console.print()
 

@@ -162,3 +162,30 @@ def test_controller_session_integration(tmp_path: Path):
     new_controller.reset()
     assert not sm.has_saved_session()
 
+
+def test_session_manager_error_log(tmp_path: Path):
+    """Verify that SessionManager logs errors to .ireri/errors.log and retrieves them."""
+    sm = SessionManager(workspace_root=tmp_path)
+    assert sm.error_log_file == tmp_path / ".ireri" / "errors.log"
+
+    # Initially empty
+    assert sm.get_recent_errors() == []
+
+    # Log several errors
+    sm.log_error("MODEL_ERROR", "Rate limit exceeded 429", {"model": "nvidia/nemotron"})
+    sm.log_error("TOOL_ERROR", "File not found: test.py", {"tool": "read_file"})
+    sm.log_error("USER_INTERRUPT", "Task cancelled by Ctrl+C")
+
+    assert sm.error_log_file.exists()
+    content = sm.error_log_file.read_text(encoding="utf-8")
+    assert "[MODEL_ERROR]" in content
+    assert "Rate limit exceeded 429" in content
+    assert "[TOOL_ERROR]" in content
+    assert "[USER_INTERRUPT]" in content
+
+    recent = sm.get_recent_errors(limit=2)
+    assert len(recent) == 2
+    assert recent[-1]["type"] == "USER_INTERRUPT"
+    assert recent[-1]["message"] == "Task cancelled by Ctrl+C"
+
+

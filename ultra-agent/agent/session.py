@@ -21,6 +21,7 @@ class SessionManager:
         self.session_dir = self._resolve_session_dir()
         self.session_file = self.session_dir / "session.json"
         self.history_file = self.session_dir / "chat_history.log"
+        self.error_log_file = self.session_dir / "errors.log"
         self._ensure_dir()
 
     def _resolve_session_dir(self) -> Path:
@@ -152,4 +153,71 @@ class SessionManager:
         # Filter for user and assistant messages for readable history
         readable = [m for m in msgs if m.get("role") in ("user", "assistant") and m.get("content")]
         return readable[-limit:]
+
+    def log_error(
+        self,
+        error_type: str,
+        message: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Log an error to .ireri/errors.log for debugging."""
+        try:
+            self._ensure_dir()
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            lines = [
+                f"[{now_str}] [{error_type.upper()}]\n",
+                f"Message: {message.strip()}\n",
+            ]
+            if details:
+                lines.append(f"Details: {json.dumps(details, ensure_ascii=False)}\n")
+            lines.append("-" * 80 + "\n\n")
+
+            with open(self.error_log_file, "a", encoding="utf-8") as f:
+                f.writelines(lines)
+        except Exception as e:
+            logger.error(f"Failed to append to errors.log: {e}")
+
+    def get_recent_errors(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Get recent logged errors from errors.log."""
+        if not self.error_log_file.exists():
+            return []
+        try:
+            with open(self.error_log_file, "r", encoding="utf-8") as f:
+                content = f.read()
+            blocks = content.strip().split("-" * 80)
+            errors = []
+            for b in blocks:
+                b = b.strip()
+                if not b:
+                    continue
+                lines = b.splitlines()
+                header = lines[0] if lines else ""
+                # Parse [timestamp] [type]
+                timestamp = ""
+                err_type = "ERROR"
+                if header.startswith("[") and "]" in header:
+                    parts = header.split("] [")
+                    if len(parts) >= 2:
+                        timestamp = parts[0].lstrip("[")
+                        err_type = parts[1].rstrip("]")
+                    else:
+                        timestamp = header.strip("[]")
+                msg = ""
+                details = ""
+                for line in lines[1:]:
+                    if line.startswith("Message: "):
+                        msg = line[9:]
+                    elif line.startswith("Details: "):
+                        details = line[9:]
+                errors.append({
+                    "timestamp": timestamp,
+                    "type": err_type,
+                    "message": msg or b,
+                    "details": details,
+                })
+            return errors[-limit:]
+        except Exception as e:
+            logger.error(f"Failed to read errors.log: {e}")
+            return []
+
 
