@@ -164,6 +164,24 @@ def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["Thi
         if thinking:
             thinking.stop()
         console.print(f"  [red]Model error:[/red] {data.get('error', 'unknown')}\n")
+    elif event == "model_retry":
+        if thinking:
+            thinking.stop()
+        attempt = data.get("attempt", 1)
+        max_attempts = data.get("max_attempts", 6)
+        delay = data.get("delay", 1)
+        err = data.get("error", "Error")
+        delay_str = f"{delay // 60}m" if delay >= 60 else f"{delay}s"
+        console.print(f"  [yellow]API error: {err}[/yellow]")
+        console.print(f"  [yellow]Retrying in {delay_str} (attempt {attempt}/{max_attempts})...[/yellow]\n")
+        if thinking:
+            thinking.start(f"[bold bright_cyan]Waiting {delay_str} before retry ({attempt}/{max_attempts})...[/bold bright_cyan]")
+    elif event == "model_retry_success":
+        if thinking:
+            thinking.stop()
+        console.print(f"  [green]OK[/green] API call recovered on retry attempt {data.get('attempt')}\n")
+        if thinking:
+            thinking.start("[bold bright_cyan]Thinking...[/bold bright_cyan]")
 
 
 class _AwaitableNone:
@@ -206,8 +224,9 @@ async def _chat_async(
     model: Optional[str],
     base_url: Optional[str],
     api_key: Optional[str],
-    max_iterations: int,
+    max_iterations: Optional[int] = None,
     auto_approve: bool = False,
+    new_session: bool = False,
 ):
     """Async implementation of chat."""
     reset_config()
@@ -225,7 +244,8 @@ async def _chat_async(
         config.openai_base_url = base_url
     if api_key:
         config.openai_api_key = api_key
-    config.max_iterations = max_iterations
+    if max_iterations is not None:
+        config.max_iterations = max_iterations
 
     # Validate
     if not config.openai_api_key:
@@ -258,6 +278,17 @@ async def _chat_async(
     controller = AgentController()
     if auto_approve:
         controller.set_approve_all(True)
+
+    # Check for preserved previous session to continue
+    if not new_session and controller.has_saved_session():
+        restored = controller.load_session()
+        if restored:
+            user_msg_count = len([m for m in controller.context.messages if m.role == "user"])
+            console.print(render_system_message(
+                f"[green]Preserved session loaded[/green] ([bold cyan]{user_msg_count}[/bold cyan] previous interaction(s) restored). "
+                f"[dim]Type '/history' to view, or '/reset' to start fresh.[/dim]"
+            ))
+            console.print()
 
     thinking = ThinkingIndicator(console)
 
@@ -388,6 +419,11 @@ async def _chat_async(
                     }
                     msg_lower = user_input.strip().lower()
                     response = responses.get(msg_lower, "Hello! How can I help you with your code?")
+                    controller.context.add_user_message(user_input)
+                    controller.context.add_assistant_message(response)
+                    controller.session_manager.log_message("USER", user_input)
+                    controller.session_manager.log_message("AGENT", response)
+                    controller.save_session()
                     console.print(render_agent_message(response))
                     continue
 
@@ -427,7 +463,9 @@ SLASH_COMMANDS = {
     "/model": "View or switch AI models",
     "/models": "List available models",
     "/status": "Show current agent status",
-    "/config": "View or edit configuration",
+    "/config": "View, set or edit configuration (e.g. /config set max_iterations 1000)",
+    "/history": "View conversation history and past messages",
+    "/continue": "Continue previous conversation session",
     "/clear": "Clear terminal conversation",
     "/reset": "Reset current session",
     "/version": "Show agent version",
@@ -541,7 +579,20 @@ async def _handle_slash_command(command: str, controller: AgentController) -> No
         return True
 
     elif cmd == "/config":
-        _show_config_command()
+        await _handle_config_command(parts, controller)
+        return True
+
+    elif cmd == "/history":
+        _show_history_command(controller, parts)
+        return True
+
+    elif cmd == "/continue":
+        if controller.has_saved_session():
+            controller.load_session()
+            count = len([m for m in controller.context.messages if m.role == "user"])
+            console.print(render_system_message(f"[green]Continued previous session ({count} user interactions restored).[/green]"))
+        else:
+            console.print(render_system_message("[yellow]No saved session found to continue.[/yellow]"))
         return True
 
     elif cmd in ("/exit", "/quit", "/q"):
@@ -574,12 +625,284 @@ async def _handle_slash_command(command: str, controller: AgentController) -> No
         return True
 
 
+def _show_history_command(controller: AgentController, parts: list) -> None:
+    """Handle /history command - display recent conversation history."""
+    limit = 10
+    if len(parts) > 1:
+        try:
+            limit = int(parts[1])
+        except ValueError:
+            pass
+
+    history = controller.session_manager.get_recent_history(limit=limit)
+    if not history:
+        console.print(render_system_message("[dim]No previous conversation history found.[/dim]"))
+        return
+
+    table = Table(title=f"Recent Conversation History (Last {len(history)} messages)", box=ROUNDED, border_style="bright_blue")
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Speaker", style="cyan", width=12)
+    table.add_column("Message Preview", style="white")
+
+    for idx, msg in enumerate(history, 1):
+        role = "[bold cyan]You[/bold cyan]" if msg.get("role") == "user" else "[bold green]ireri[/bold green]"
+        content = msg.get("content", "").strip().replace("\n", " ")
+        if len(content) > 90:
+            content = content[:87] + "..."
+        table.add_row(str(idx), role, content)
+
+    console.print()
+    console.print(table)
+    console.print(render_system_message(
+        f"[dim]Full transcript logged at: [underline]{controller.session_manager.history_file}[/underline][/dim]"
+    ))
+    console.print()
+
+
+# Configuration key mappings and aliases
+CONFIG_KEY_MAP = {
+    "max_iterations": "max_iterations",
+    "iterations": "max_iterations",
+    "iter": "max_iterations",
+    "max-iterations": "max_iterations",
+    "max_iter": "max_iterations",
+    "max_tool_calls": "max_tool_calls",
+    "tool_calls": "max_tool_calls",
+    "tools": "max_tool_calls",
+    "max-tool-calls": "max_tool_calls",
+    "max_tools": "max_tool_calls",
+    "command_timeout": "command_timeout",
+    "timeout": "command_timeout",
+    "cmd_timeout": "command_timeout",
+    "command-timeout": "command_timeout",
+    "model": "openai_model",
+    "openai_model": "openai_model",
+    "base_url": "openai_base_url",
+    "url": "openai_base_url",
+    "openai_base_url": "openai_base_url",
+    "api_key": "openai_api_key",
+    "key": "openai_api_key",
+    "openai_api_key": "openai_api_key",
+    "log_level": "log_level",
+    "log": "log_level",
+    "level": "log_level",
+}
+
+
+def set_config_value(key: str, value: Any, controller: Optional[AgentController] = None) -> tuple[bool, str]:
+    """Set and persist a configuration value immediately to global config and active controller."""
+    from agent.config import get_config, update_config
+    from agent.model import reset_model_client, get_model_client
+
+    key_normalized = key.lower().replace("-", "_")
+    target_field = CONFIG_KEY_MAP.get(key_normalized)
+    if not target_field:
+        valid_keys = ", ".join(["max_iterations", "max_tool_calls", "command_timeout", "model", "base_url", "api_key", "log_level"])
+        return False, f"Unknown setting '{key}'. Valid settings: {valid_keys}"
+
+    # Type validation & conversion
+    if target_field in ("max_iterations", "max_tool_calls", "command_timeout"):
+        try:
+            val = int(value)
+            if val <= 0:
+                return False, f"{target_field} must be a positive integer"
+        except (ValueError, TypeError):
+            return False, f"Invalid integer value for {target_field}: {value}"
+    elif target_field == "log_level":
+        val = str(value).upper()
+        if val not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            return False, f"Invalid log level: {value}. Choose from: DEBUG, INFO, WARNING, ERROR, CRITICAL"
+    else:
+        val = str(value).strip()
+        if not val:
+            return False, f"{target_field} cannot be empty"
+
+    update_config(**{target_field: val})
+
+    # Update active controller and model client if in active chat session
+    if controller is not None:
+        controller.config = get_config()
+        if target_field in ("openai_model", "openai_base_url", "openai_api_key"):
+            reset_model_client()
+            controller.model_client = get_model_client()
+
+    return True, f"Updated [bold cyan]{target_field}[/bold cyan] to [bold green]{val}[/bold green]"
+
+
+def _show_config_table(config: AgentConfig) -> None:
+    """Render the configuration table with editing instructions."""
+    table = Table(title="ireri Configuration", box=ROUNDED, border_style="bright_blue")
+    table.add_column("Setting", style="cyan", width=18)
+    table.add_column("Value", style="white")
+    table.add_column("Description", style="dim")
+
+    table.add_row("Model", config.openai_model, "Active LLM model name")
+    table.add_row("Base URL", config.openai_base_url, "API endpoint base URL")
+    table.add_row("API Key", ("***" + config.openai_api_key[-4:]) if config.openai_api_key else "Not set", "Provider API secret key")
+    table.add_row("Workspace", str(config.workspace_root), "Current working workspace directory")
+    table.add_row("Max Iterations", str(config.max_iterations), "Max reasoning/tool iterations per task")
+    table.add_row("Max Tool Calls", str(config.max_tool_calls), "Max total tool executions per task")
+    table.add_row("Command Timeout", f"{config.command_timeout}s", "Timeout for shell commands in seconds")
+    table.add_row("Log Level", config.log_level, "Logging verbosity (DEBUG, INFO, WARNING, ERROR)")
+
+    console.print()
+    console.print(table)
+    console.print()
+    help_panel = (
+        "[bold cyan]How to change settings:[/bold cyan]\n"
+        "  • [yellow]/config set <setting> <value>[/yellow]  (e.g., [green]/config set max_iterations 1000[/green])\n"
+        "  • [yellow]/config <setting> <value>[/yellow]      (shorthand, e.g. [green]/config max_tool_calls 1000[/green])\n"
+        "  • [yellow]/config edit[/yellow]                   (interactive configuration wizard)\n"
+        "  • [yellow]/config get <setting>[/yellow]          (view specific value)\n"
+        "  • [yellow]/settings set <setting> <val>[/yellow]  (works in /settings too!)"
+    )
+    console.print(Panel(help_panel, title="[bold]Configuration Controls[/bold]", border_style="dim", box=ROUNDED))
+    console.print()
+
+
+async def _interactive_config_edit(controller: Optional[AgentController] = None) -> None:
+    """Interactive wizard to change any configuration setting."""
+    config = get_config()
+    console.print()
+    console.print("[bold bright_cyan]Interactive Configuration Editor[/bold bright_cyan]")
+    console.print(f"  [bold]1[/bold]) Max Iterations     [dim](current: {config.max_iterations})[/dim]")
+    console.print(f"  [bold]2[/bold]) Max Tool Calls     [dim](current: {config.max_tool_calls})[/dim]")
+    console.print(f"  [bold]3[/bold]) Command Timeout    [dim](current: {config.command_timeout}s)[/dim]")
+    console.print(f"  [bold]4[/bold]) Model              [dim](current: {config.openai_model})[/dim]")
+    console.print(f"  [bold]5[/bold]) Base URL           [dim](current: {config.openai_base_url})[/dim]")
+    console.print(f"  [bold]6[/bold]) API Key            [dim](current: {('***' + config.openai_api_key[-4:]) if config.openai_api_key else 'Not set'})[/dim]")
+    console.print(f"  [bold]7[/bold]) Log Level          [dim](current: {config.log_level})[/dim]")
+    console.print("  [bold]0[/bold]) Cancel")
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+    choice = await loop.run_in_executor(
+        None,
+        lambda: Prompt.ask("[bold cyan]Select setting to edit[/bold cyan]", choices=["0", "1", "2", "3", "4", "5", "6", "7"], default="1")
+    )
+
+    if choice == "0":
+        console.print("[dim]Edit cancelled.[/dim]")
+        return
+
+    mapping = {
+        "1": ("max_iterations", str(config.max_iterations)),
+        "2": ("max_tool_calls", str(config.max_tool_calls)),
+        "3": ("command_timeout", str(config.command_timeout)),
+        "4": ("model", config.openai_model),
+        "5": ("base_url", config.openai_base_url),
+        "6": ("api_key", ""),
+        "7": ("log_level", config.log_level),
+    }
+
+    setting_key, default_val = mapping[choice]
+    new_val = await loop.run_in_executor(
+        None,
+        lambda: Prompt.ask(f"[bold cyan]Enter new value for {setting_key}[/bold cyan]", default=default_val)
+    )
+
+    if not new_val.strip():
+        console.print("[yellow]No change made.[/yellow]")
+        return
+
+    ok, msg = set_config_value(setting_key, new_val.strip(), controller)
+    if ok:
+        console.print(render_system_message(f"[green]{msg}[/green]"))
+    else:
+        console.print(render_system_message(f"[red]{msg}[/red]"))
+
+
+async def _handle_config_command(parts: list, controller: Optional[AgentController] = None) -> None:
+    """Handle /config slash command and its subcommands."""
+    if len(parts) == 1:
+        _show_config_table(get_config())
+        return
+
+    sub = parts[1].lower()
+
+    if sub in ("help", "-h", "--help"):
+        _show_config_table(get_config())
+        return
+
+    elif sub in ("edit", "wizard", "interactive"):
+        await _interactive_config_edit(controller)
+        return
+
+    elif sub == "set":
+        if len(parts) < 4:
+            console.print("[red]Usage: /config set <setting> <value>[/red]")
+            console.print("[dim]Example: /config set max_iterations 1000[/dim]")
+            return
+        key = parts[2]
+        val = " ".join(parts[3:])
+        ok, msg = set_config_value(key, val, controller)
+        if ok:
+            console.print(render_system_message(f"[green]{msg}[/green]"))
+        else:
+            console.print(render_system_message(f"[red]{msg}[/red]"))
+        return
+
+    elif sub == "get":
+        if len(parts) < 3:
+            console.print("[red]Usage: /config get <setting>[/red]")
+            return
+        key = parts[2].lower().replace("-", "_")
+        mapped = CONFIG_KEY_MAP.get(key, key)
+        config = get_config()
+        if hasattr(config, mapped):
+            val = getattr(config, mapped)
+            if mapped == "openai_api_key" and val:
+                val = "***" + val[-4:]
+            console.print(render_system_message(f"[bold cyan]{mapped}[/bold cyan]: {val}"))
+        else:
+            console.print(render_system_message(f"[red]Unknown setting: {parts[2]}[/red]"))
+        return
+
+    elif sub == "reset":
+        set_config_value("max_iterations", 1000, controller)
+        set_config_value("max_tool_calls", 1000, controller)
+        set_config_value("command_timeout", 60, controller)
+        console.print(render_system_message("[green]Reset iterations, tool calls, and timeout to defaults (1000 / 1000 / 60s).[/green]"))
+        return
+
+    # Check if user passed shorthand: /config <setting> <value>
+    key_normalized = sub.replace("-", "_")
+    if key_normalized in CONFIG_KEY_MAP and len(parts) >= 3:
+        val = " ".join(parts[2:])
+        ok, msg = set_config_value(sub, val, controller)
+        if ok:
+            console.print(render_system_message(f"[green]{msg}[/green]"))
+        else:
+            console.print(render_system_message(f"[red]{msg}[/red]"))
+        return
+
+    console.print(f"[yellow]Unknown config subcommand: '{sub}'. Type /config for available options.[/yellow]")
+
+
 async def _handle_provider_command(parts: list, controller: AgentController) -> None:
-    """Handle /provider and /settings slash commands for configuring AI providers."""
+    """Handle /provider and /settings slash commands for configuring AI providers and settings."""
     from agent.config import get_config, get_profiles, save_profile, delete_profile, load_profile
     from agent.model import reset_model_client, get_model_client
 
     subcommand = parts[1].lower() if len(parts) > 1 else ""
+
+    if subcommand == "set":
+        if len(parts) < 4:
+            console.print("[red]Usage: /settings set <setting> <value>[/red]")
+            console.print("[dim]Example: /settings set max_iterations 1000[/dim]")
+            return
+        key = parts[2]
+        val = " ".join(parts[3:])
+        ok, msg = set_config_value(key, val, controller)
+        if ok:
+            console.print(render_system_message(f"[green]{msg}[/green]"))
+        else:
+            console.print(render_system_message(f"[red]{msg}[/red]"))
+        return
+
+    elif subcommand in ("edit", "wizard"):
+        await _interactive_config_edit(controller)
+        return
 
     if not subcommand or subcommand == "list":
         config = get_config()
@@ -589,7 +912,9 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
         info_text = (
             f"[bold bright_green]Active Model:[/bold bright_green] [cyan]{config.openai_model}[/cyan]\n"
             f"[bold bright_green]Active Base URL:[/bold bright_green] [dim]{config.openai_base_url}[/dim]\n"
-            f"[bold bright_green]API Key:[/bold bright_green] [dim]{('***' + config.openai_api_key[-4:]) if config.openai_api_key else 'Not set'}[/dim]\n\n"
+            f"[bold bright_green]API Key:[/bold bright_green] [dim]{('***' + config.openai_api_key[-4:]) if config.openai_api_key else 'Not set'}[/dim]\n"
+            f"[bold bright_green]Max Iterations:[/bold bright_green] [green]{config.max_iterations}[/green]  •  "
+            f"[bold bright_green]Max Tool Calls:[/bold bright_green] [green]{config.max_tool_calls}[/green]\n\n"
             "[bold bright_yellow]★ RECOMMENDED: NVIDIA NIM Free Models ★[/bold bright_yellow]\n"
             "NVIDIA provides 1,000 free API credits with access to top-tier open models.\n"
             "• [bold]Register for free key:[/bold] [underline cyan]https://build.nvidia.com/[/underline cyan]\n"
@@ -599,7 +924,10 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
             "• [cyan]/provider nvidia[/cyan]      -> Fast 1-step setup for NVIDIA NIM\n"
             "• [cyan]/provider add[/cyan]         -> Guided wizard to add any provider (NVIDIA, OpenAI, Groq...)\n"
             "• [cyan]/provider use <name>[/cyan] -> Switch active provider profile\n"
-            "• [cyan]/provider list[/cyan]        -> List all saved profiles"
+            "• [cyan]/provider list[/cyan]        -> List all saved profiles\n"
+            "• [cyan]/settings set <name> <val>[/cyan] -> Change setting (e.g. /settings set max_iterations 1000)\n"
+            "• [cyan]/settings edit[/cyan]        -> Interactive configuration editor\n"
+            "• [cyan]/config[/cyan]               -> Full configuration table"
         )
         console.print()
         console.print(Panel(
@@ -806,11 +1134,14 @@ def chat(
     api_key: Optional[str] = typer.Option(
         None, "--api-key", "-k", help="API key"
     ),
-    max_iterations: int = typer.Option(
-        50, "--max-iterations", "-i", help="Maximum iterations"
+    max_iterations: Optional[int] = typer.Option(
+        None, "--max-iterations", "-i", help="Maximum iterations (default: 1000)"
     ),
     auto_approve: bool = typer.Option(
         False, "--yes", "-y", "--auto-approve", help="Auto-approve all tool calls"
+    ),
+    new_session: bool = typer.Option(
+        False, "--new", help="Start a new session without resuming previous history"
     ),
 ):
     """Start an interactive chat session with ireri."""
@@ -822,7 +1153,7 @@ def chat(
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(_chat_async(project, model, base_url, api_key, max_iterations, auto_approve))
+        loop.run_until_complete(_chat_async(project, model, base_url, api_key, max_iterations, auto_approve, new_session))
     finally:
         # Don't close if we didn't create it
         if not loop.is_closed() and loop != asyncio.get_event_loop():
@@ -844,8 +1175,8 @@ def run(
     api_key: Optional[str] = typer.Option(
         None, "--api-key", "-k", help="API key"
     ),
-    max_iterations: int = typer.Option(
-        50, "--max-iterations", "-i", help="Maximum iterations"
+    max_iterations: Optional[int] = typer.Option(
+        None, "--max-iterations", "-i", help="Maximum iterations (default: 1000)"
     ),
     json_output: bool = typer.Option(
         False, "--json", "-j", help="Output result as JSON"
@@ -871,7 +1202,8 @@ def run(
         config.openai_base_url = base_url
     if api_key:
         config.openai_api_key = api_key
-    config.max_iterations = max_iterations
+    if max_iterations is not None:
+        config.max_iterations = max_iterations
 
     # Validate
     if not config.openai_api_key:
@@ -926,27 +1258,57 @@ def tools():
     console.print()
 
 
+@app.command(name="config")
+def config_cli(
+    action: Optional[str] = typer.Argument(None, help="Action: show, set, get, edit"),
+    key: Optional[str] = typer.Argument(None, help="Setting name (for set/get)"),
+    value: Optional[str] = typer.Argument(None, help="Setting value (for set)"),
+):
+    """View or modify ireri configuration."""
+    if action is None or action == "show":
+        _show_config_table(get_config())
+    elif action == "set":
+        if not key or not value:
+            console.print("[red]Usage: ireri config set <setting> <value>[/red]")
+            console.print("[dim]Example: ireri config set max_iterations 1000[/dim]")
+            raise typer.Exit(1)
+        ok, msg = set_config_value(key, value)
+        if ok:
+            console.print(render_system_message(f"[green]{msg}[/green]"))
+        else:
+            console.print(render_system_message(f"[red]{msg}[/red]"))
+            raise typer.Exit(1)
+    elif action == "get":
+        if not key:
+            console.print("[red]Usage: ireri config get <setting>[/red]")
+            raise typer.Exit(1)
+        key_norm = key.lower().replace("-", "_")
+        mapped = CONFIG_KEY_MAP.get(key_norm, key_norm)
+        cfg = get_config()
+        if hasattr(cfg, mapped):
+            val = getattr(cfg, mapped)
+            if mapped == "openai_api_key" and val:
+                val = "***" + val[-4:]
+            console.print(f"{mapped}: {val}")
+        else:
+            console.print(f"[red]Unknown setting: {key}[/red]")
+            raise typer.Exit(1)
+    elif action.lower().replace("-", "_") in CONFIG_KEY_MAP and key is not None:
+        # Shorthand: ireri config max_iterations 1000
+        ok, msg = set_config_value(action, key)
+        if ok:
+            console.print(render_system_message(f"[green]{msg}[/green]"))
+        else:
+            console.print(render_system_message(f"[red]{msg}[/red]"))
+            raise typer.Exit(1)
+    else:
+        _show_config_table(get_config())
+
+
 @app.command()
 def config_show():
     """Show current configuration."""
-    config = get_config()
-
-    table = Table(title="ireri Configuration", box=ROUNDED, border_style="bright_blue")
-    table.add_column("Setting", style="cyan")
-    table.add_column("Value", style="white")
-
-    table.add_row("Model", config.openai_model)
-    table.add_row("Base URL", config.openai_base_url)
-    table.add_row("API Key", "***" + config.openai_api_key[-4:] if config.openai_api_key else "Not set")
-    table.add_row("Workspace", str(config.workspace_root))
-    table.add_row("Max Iterations", str(config.max_iterations))
-    table.add_row("Max Tool Calls", str(config.max_tool_calls))
-    table.add_row("Command Timeout", f"{config.command_timeout}s")
-    table.add_row("Log Level", config.log_level)
-
-    console.print()
-    console.print(table)
-    console.print()
+    _show_config_table(get_config())
 
 
 @app.command()
@@ -1140,6 +1502,7 @@ def _show_status_command(controller: AgentController) -> None:
     table.add_row("Base URL", config.openai_base_url)
     table.add_row("Workspace", str(config.workspace_root))
     table.add_row("Max Iterations", str(config.max_iterations))
+    table.add_row("Max Tool Calls", str(config.max_tool_calls))
     table.add_row("Session", "Active")
 
     console.print()
@@ -1149,23 +1512,7 @@ def _show_status_command(controller: AgentController) -> None:
 
 def _show_config_command() -> None:
     """Handle /config command - view or edit configuration."""
-    config = get_config()
-    table = Table(title="ireri Configuration", box=ROUNDED, border_style="bright_blue")
-    table.add_column("Setting", style="cyan")
-    table.add_column("Value", style="white")
-
-    table.add_row("Model", config.openai_model)
-    table.add_row("Base URL", config.openai_base_url)
-    table.add_row("API Key", "***" + config.openai_api_key[-4:] if config.openai_api_key else "Not set")
-    table.add_row("Workspace", str(config.workspace_root))
-    table.add_row("Max Iterations", str(config.max_iterations))
-    table.add_row("Max Tool Calls", str(config.max_tool_calls))
-    table.add_row("Command Timeout", f"{config.command_timeout}s")
-    table.add_row("Log Level", config.log_level)
-
-    console.print()
-    console.print(table)
-    console.print()
+    _show_config_table(get_config())
 
 
 def _show_version_command() -> None:

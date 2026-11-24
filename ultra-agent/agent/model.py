@@ -1,8 +1,9 @@
 """Model client for ireri."""
 
 import os
+import asyncio
 import logging
-from typing import Any, Dict, List, Optional, AsyncGenerator
+from typing import Any, Callable, Dict, List, Optional, AsyncGenerator
 from dataclasses import dataclass
 
 from openai import AsyncOpenAI
@@ -11,6 +12,9 @@ from pydantic import BaseModel
 from agent.config import get_config
 
 logger = logging.getLogger(__name__)
+
+# Incremental retry delays in seconds: 1s, 5s, 15s, 30s, 1m (60s), 3m (180s)
+RETRY_DELAYS = [1, 5, 15, 30, 60, 180]
 
 
 @dataclass
@@ -46,6 +50,7 @@ class ModelClient:
             api_key=self.api_key,
             base_url=self.base_url,
         )
+        self.progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None
 
         logger.info(f"Model client initialized: {self.model} @ {self.base_url}")
 
@@ -57,32 +62,61 @@ class ModelClient:
         temperature: float = 0.1,
         max_tokens: Optional[int] = None,
         stream: bool = False,
+        retry_delays: Optional[List[int]] = None,
+        progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> ModelResponse:
-        """Send a chat completion request."""
-        try:
-            kwargs = {
-                "model": self.model,
-                "messages": messages,
-                "temperature": temperature,
-            }
+        """Send a chat completion request with incremental retry delay on error."""
+        delays = retry_delays if retry_delays is not None else RETRY_DELAYS
+        cb = progress_callback or self.progress_callback
+        total_attempts = len(delays) + 1
 
-            if max_tokens:
-                kwargs["max_tokens"] = max_tokens
+        for attempt_idx in range(total_attempts):
+            try:
+                kwargs = {
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": temperature,
+                }
 
-            if tools:
-                kwargs["tools"] = tools
-                if tool_choice:
-                    kwargs["tool_choice"] = tool_choice
+                if max_tokens:
+                    kwargs["max_tokens"] = max_tokens
 
-            if stream:
-                return await self._stream_chat(**kwargs)
-            else:
-                response = await self.client.chat.completions.create(**kwargs)
-                return self._parse_response(response)
+                if tools:
+                    kwargs["tools"] = tools
+                    if tool_choice:
+                        kwargs["tool_choice"] = tool_choice
 
-        except Exception as e:
-            logger.error(f"Model API error: {e}")
-            raise
+                if stream:
+                    response = await self._stream_chat(**kwargs)
+                else:
+                    raw_response = await self.client.chat.completions.create(**kwargs)
+                    response = self._parse_response(raw_response)
+
+                if attempt_idx > 0:
+                    logger.info(f"Model API call recovered on retry {attempt_idx}")
+                    if cb:
+                        cb("model_retry_success", {"attempt": attempt_idx})
+
+                return response
+
+            except Exception as e:
+                if attempt_idx < len(delays):
+                    delay = delays[attempt_idx]
+                    retry_num = attempt_idx + 1
+                    logger.warning(
+                        f"Model API error: {e}. Retrying in {delay}s (attempt {retry_num}/{len(delays)})..."
+                    )
+                    if cb:
+                        cb("model_retry", {
+                            "error": str(e),
+                            "attempt": retry_num,
+                            "max_attempts": len(delays),
+                            "delay": delay,
+                        })
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"Model API error exhausted all {len(delays)} retries: {e}")
+                    raise
 
     async def _stream_chat(self, **kwargs) -> ModelResponse:
         """Handle streaming response."""

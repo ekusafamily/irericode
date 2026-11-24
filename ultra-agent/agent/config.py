@@ -38,11 +38,11 @@ class AgentConfig(BaseSettings):
 
     # Agent Behavior
     max_iterations: int = Field(
-        default=50,
+        default=1000,
         description="Maximum agent loop iterations per task"
     )
     max_tool_calls: int = Field(
-        default=50,
+        default=1000,
         description="Maximum tool calls per task"
     )
     command_timeout: int = Field(

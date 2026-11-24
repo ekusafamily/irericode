@@ -8,9 +8,10 @@ from typing import Any, Callable, Dict, List, Optional
 
 from agent.config import get_config
 from agent.model import get_model_client, ModelClient, ModelResponse
-from agent.context import ContextManager
+from agent.context import ContextManager, ContextEntry
 from agent.prompts import get_system_prompt, get_task_prompt, get_continuation_prompt, get_error_recovery_prompt
 from agent.tools import get_registry, ToolRegistry, ToolResult
+from agent.session import SessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ class AgentController:
         model_client: Optional[ModelClient] = None,
         tool_registry: Optional[ToolRegistry] = None,
         context: Optional[ContextManager] = None,
+        session_manager: Optional[SessionManager] = None,
         model: Optional[str] = None,
         progress_callback: Optional[ProgressCallback] = None,
         approval_callback: Optional[ApprovalCallback] = None,
@@ -48,6 +50,11 @@ class AgentController:
         self.progress_callback = progress_callback
         self.approval_callback = approval_callback
 
+        if self.progress_callback:
+            self.model_client.progress_callback = self.progress_callback
+
+        self.session_manager = session_manager or SessionManager(workspace_root=self.config.workspace_root)
+
         # Add system prompt
         self.context.add_system_message(get_system_prompt())
 
@@ -60,10 +67,43 @@ class AgentController:
         self._approve_all = False
         self._deny_all = False
 
+    def load_session(self) -> bool:
+        """Load saved session into context if available."""
+        data = self.session_manager.load_session()
+        if not data:
+            return False
+        ctx_data = data.get("context", {})
+        saved_messages = ctx_data.get("messages", [])
+        non_system = [m for m in saved_messages if m.get("role") != "system"]
+        if not non_system:
+            return False
+
+        # Keep existing system message, append saved conversation messages
+        system_msgs = [m for m in self.context.messages if m.role == "system"]
+        self.context.messages = system_msgs + [ContextEntry(**m) for m in non_system]
+        self.context.files_inspected = ctx_data.get("files_inspected", {})
+        self.context.project_summary = ctx_data.get("project_summary", "")
+        self.context.tool_calls_count = ctx_data.get("tool_calls_count", 0)
+        logger.info(f"Loaded saved session: {len(non_system)} messages restored")
+        return True
+
+    def save_session(self) -> bool:
+        """Save current context to session file."""
+        return self.session_manager.save_session(self.context, model=self.model_client.model)
+
+    def has_saved_session(self) -> bool:
+        """Check if a saved session exists."""
+        return self.session_manager.has_saved_session()
+
+    def clear_saved_session(self) -> bool:
+        """Clear saved session file."""
+        return self.session_manager.clear_session()
+
     def reset(self) -> None:
         """Reset the controller state for a new session."""
         self.context.clear()
         self.context.add_system_message(get_system_prompt())
+        self.clear_saved_session()
         self.running = False
         self.cancelled = False
         self.last_error = None
@@ -76,9 +116,13 @@ class AgentController:
         self.cancelled = False
         if progress_callback:
             self.progress_callback = progress_callback
+            self.model_client.progress_callback = progress_callback
 
         # Reset iteration count for each message generation
         self.context.reset_iteration_count()
+
+        # Log user task to history
+        self.session_manager.log_message("USER", task)
 
         # Add task to context
         prompt = get_task_prompt(task, project_context)
@@ -86,10 +130,14 @@ class AgentController:
 
         try:
             result = await self._agent_loop()
+            # Log agent result to history
+            self.session_manager.log_message("AGENT", result)
+            self.save_session()
             return result
         finally:
             self.running = False
             self.context.reset_iteration_count()
+            self.save_session()
 
     async def _agent_loop(self) -> str:
         """Main agent loop."""
@@ -129,6 +177,7 @@ class AgentController:
                     tools=tools,
                     tool_choice="auto",
                     temperature=0.1,
+                    progress_callback=self.progress_callback,
                 )
             except Exception as e:
                 logger.error(f"Model call failed: {e}")
@@ -166,16 +215,33 @@ class AgentController:
                     result = await self._execute_tool_call(tool_call)
 
                     # Add tool result to context
+                    tool_out_str = json.dumps(result.output) if result.success else result.error or "Tool failed"
                     self.context.add_tool_result(
                         tool_call_id=tool_call["id"],
                         name=tool_call["function"]["name"],
-                        content=json.dumps(result.output) if result.success else result.error or "Tool failed",
+                        content=tool_out_str,
+                    )
+
+                    # Log tool call to history
+                    args_data = tool_call.get("function", {}).get("arguments")
+                    if isinstance(args_data, str):
+                        try:
+                            args_data = json.loads(args_data)
+                        except Exception:
+                            pass
+                    self.session_manager.log_message(
+                        "TOOL_CALL",
+                        content=tool_out_str,
+                        tool_name=tool_call["function"]["name"],
+                        tool_args=args_data if isinstance(args_data, dict) else {},
                     )
 
                     # Check if tool failed
                     if not result.success:
                         self.last_error = result.error
                         logger.warning(f"Tool {tool_call['function']['name']} failed: {result.error}")
+
+                self.save_session()
 
             elif response.content:
                 # Regular response - add to context and continue
