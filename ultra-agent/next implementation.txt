@@ -1,0 +1,2 @@
+global installation and maybe rust
+logs of errors for debugging
