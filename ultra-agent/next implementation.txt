@@ -1,7 +1,9 @@
-global installation and maybe rust
-logs of errors for debugging
-new user ease to use it new install add api key synchrinazisation , 
+if user deny the agent  permision give the agent what to do optional ,,,
 
+when typing slash / commands the first suggestion is autmoatically choosen if the user presses enter without full typing of the command 
+
+new user ease to use it new install add api key synchrinazisation , 
+like the agent to initialize without the API  key 
 to be given the choice to  add the base url  , api key and default model on first ireri chat run, make 'ireri' to be the start command instead of 'ireri chat'
-also add preset for nvidia NIM with the base url pre-set and the base model set to nvidia/nemotron-3.5-super-vl-120b-a12b     only to add the api key ,,
+also add preset for nvidia NIM with the base url pre-set and the base model set to nvidia/nemotron-3.5-super-vl-120b-a12b     only to add the api key ,, then they can change the default model later 
 to be easy to unboard beginners ,  and make this version 2.1.0 when completed this implemenations 
