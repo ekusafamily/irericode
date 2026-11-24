@@ -1,5 +1,5 @@
 # IRERI CODE 🚀
-### Terminal AI Coding Agent (v0.1.0)
+### Terminal AI Coding Agent (v2.0.0)
 
 ```
   ██╗██████╗ ███████╗██████╗ ██╗    ██████╗ ██████╗ ██████╗ ███████╗

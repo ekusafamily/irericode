@@ -279,7 +279,7 @@ async def _chat_async(
     for line in banner_lines:
         console.print(f"[bold bright_cyan]{line}[/bold bright_cyan]")
     console.print()
-    console.print("[bold bright_green]  Terminal AI Coding Agent  v0.1.0[/bold bright_green]")
+    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.0.0[/bold bright_green]")
     console.print()
     console.print(render_system_message(
         f"Model: [green]{config.openai_model}[/green]  •  "
@@ -1759,7 +1759,7 @@ def _show_config_command() -> None:
 def _show_version_command() -> None:
     """Handle /version command."""
     console.print(Panel(
-        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v0.1.0[/bright_green]\n"
+        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.0.0[/bright_green]\n"
         "Terminal AI Coding Agent\n"
         "https://github.com/ekusafamily/ireri-code",
         title="[bold]Version Info[/bold]",
