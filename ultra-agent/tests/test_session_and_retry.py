@@ -306,5 +306,95 @@ async def test_model_client_timeout_diagnosis_and_reload():
     assert client.client is not initial_internal_client
 
 
+def test_context_manager_token_tracking():
+    """Verify ContextManager tracks prompt tokens, completion tokens, and serializes them."""
+    ctx = ContextManager()
+    assert ctx.total_prompt_tokens == 0
+    assert ctx.total_completion_tokens == 0
+
+    ctx.add_user_message("Hello, how are you?")
+    stats1 = ctx.get_token_stats()
+    assert stats1["tokens_up"] == 0
+    assert stats1["tokens_down"] == 0
+    assert stats1["approx_context_tokens"] > 0
+
+    # Add usage
+    ctx.add_token_usage(prompt_tokens=150, completion_tokens=45)
+    ctx.add_token_usage(prompt_tokens=200, completion_tokens=60)
+
+    stats2 = ctx.get_token_stats()
+    assert stats2["tokens_up"] == 350
+    assert stats2["tokens_down"] == 105
+    assert stats2["total_tokens"] == 455
+    assert stats2["approx_context_tokens"] > 0
+
+    # Serialization to dict & restoration
+    d = ctx.to_dict()
+    assert d["total_prompt_tokens"] == 350
+    assert d["total_completion_tokens"] == 105
+
+    restored = ContextManager.from_dict(d)
+    assert restored.total_prompt_tokens == 350
+    assert restored.total_completion_tokens == 105
+    assert restored.get_token_stats()["total_tokens"] == 455
+
+    # Clear resets tokens
+    ctx.clear()
+    assert ctx.total_prompt_tokens == 0
+    assert ctx.total_completion_tokens == 0
+    assert ctx.get_token_stats()["total_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_controller_token_tracking_and_status(tmp_path: Path):
+    """Verify AgentController tracks tokens during run_task and /btw, reporting via get_status()."""
+    sm = SessionManager(workspace_root=tmp_path)
+    controller = AgentController(session_manager=sm)
+
+    # Mock response with usage
+    mock_resp = ModelResponse(
+        content="Task completed successfully.",
+        usage={"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150}
+    )
+    controller.model_client.chat = AsyncMock(return_value=mock_resp)
+
+    events = []
+    def callback(event, data):
+        events.append((event, data))
+
+    result = await controller.run_task("Count to 10", progress_callback=callback)
+    assert "Task completed successfully" in result
+
+    # Check progress callback received token metrics
+    resp_events = [e for e in events if e[0] == "model_response"]
+    assert len(resp_events) == 1
+    event_data = resp_events[0][1]
+    assert event_data["tokens_up"] == 120
+    assert event_data["tokens_down"] == 30
+    assert event_data["total_tokens_up"] == 120
+    assert event_data["total_tokens_down"] == 30
+
+    # Verify controller.get_status()
+    status = controller.get_status()
+    assert status["tokens_up"] == 120
+    assert status["tokens_down"] == 30
+    assert status["total_tokens"] == 150
+    assert status["approx_context_tokens"] > 0
+
+    # Run /btw and verify tokens accumulate
+    mock_btw_resp = ModelResponse(
+        content="Direct answer.",
+        usage={"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60}
+    )
+    controller.model_client.chat = AsyncMock(return_value=mock_btw_resp)
+    await controller.ask_direct("Quick question?")
+
+    status2 = controller.get_status()
+    assert status2["tokens_up"] == 170
+    assert status2["tokens_down"] == 40
+    assert status2["total_tokens"] == 210
+
+
+
 
 

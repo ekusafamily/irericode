@@ -32,6 +32,8 @@ class ContextManager:
         self.files_inspected: Dict[str, int] = {}  # path -> line count
         self.tool_calls_count = 0
         self.iteration_count = 0
+        self.total_prompt_tokens = 0       # Tokens up (sent to model)
+        self.total_completion_tokens = 0   # Tokens down (received from model)
 
     def add_user_message(self, content: str) -> None:
         """Add a user message."""
@@ -137,6 +139,22 @@ class ContextManager:
         self.messages = system_msgs
         self.tool_calls_count = 0
         self.iteration_count = 0
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+
+    def add_token_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
+        """Accumulate token usage for the session."""
+        self.total_prompt_tokens += max(0, prompt_tokens)
+        self.total_completion_tokens += max(0, completion_tokens)
+
+    def get_token_stats(self) -> Dict[str, Any]:
+        """Get session token statistics and active context estimation."""
+        return {
+            "tokens_up": self.total_prompt_tokens,
+            "tokens_down": self.total_completion_tokens,
+            "total_tokens": self.total_prompt_tokens + self.total_completion_tokens,
+            "approx_context_tokens": self.estimate_tokens(),
+        }
 
     def estimate_tokens(self) -> int:
         """Rough token estimation."""
@@ -176,6 +194,8 @@ class ContextManager:
             "files_inspected": self.files_inspected,
             "tool_calls_count": self.tool_calls_count,
             "iteration_count": self.iteration_count,
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_completion_tokens": self.total_completion_tokens,
         }
 
     @classmethod
@@ -186,6 +206,8 @@ class ContextManager:
         ctx.files_inspected = data.get("files_inspected", {})
         ctx.tool_calls_count = data.get("tool_calls_count", 0)
         ctx.iteration_count = data.get("iteration_count", 0)
+        ctx.total_prompt_tokens = data.get("total_prompt_tokens", 0)
+        ctx.total_completion_tokens = data.get("total_completion_tokens", 0)
 
         for msg_data in data.get("messages", []):
             ctx.messages.append(ContextEntry(**msg_data))

@@ -86,6 +86,8 @@ class AgentController:
         self.context.files_inspected = ctx_data.get("files_inspected", {})
         self.context.project_summary = ctx_data.get("project_summary", "")
         self.context.tool_calls_count = ctx_data.get("tool_calls_count", 0)
+        self.context.total_prompt_tokens = ctx_data.get("total_prompt_tokens", 0)
+        self.context.total_completion_tokens = ctx_data.get("total_completion_tokens", 0)
         logger.info(f"Loaded saved session: {len(non_system)} messages restored")
         return True
 
@@ -198,14 +200,32 @@ class AgentController:
                 self.context.add_user_message(error_prompt)
                 continue
 
-            logger.info(f"Model response: content={response.content[:100] if response.content else None}, tool_calls={len(response.tool_calls) if response.tool_calls else 0}")
+            # Track token usage from model response
+            p_tokens = 0
+            c_tokens = 0
+            if response.usage:
+                p_tokens = response.usage.get("prompt_tokens", 0) or 0
+                c_tokens = response.usage.get("completion_tokens", 0) or 0
+            if not p_tokens:
+                p_tokens = self.context.estimate_tokens()
+            if not c_tokens and response.content:
+                c_tokens = max(1, len(response.content) // 4)
 
-            # Emit progress: model response
+            self.context.add_token_usage(p_tokens, c_tokens)
+
+            logger.info(f"Model response: tokens=(↑{p_tokens}, ↓{c_tokens}), content={response.content[:100] if response.content else None}, tool_calls={len(response.tool_calls) if response.tool_calls else 0}")
+
+            # Emit progress: model response with tokens up/down and approx context
             if self.progress_callback:
                 self.progress_callback("model_response", {
                     "has_content": bool(response.content),
                     "tool_calls_count": len(response.tool_calls) if response.tool_calls else 0,
                     "finish_reason": response.finish_reason,
+                    "tokens_up": p_tokens,
+                    "tokens_down": c_tokens,
+                    "total_tokens_up": self.context.total_prompt_tokens,
+                    "total_tokens_down": self.context.total_completion_tokens,
+                    "approx_context_tokens": self.context.estimate_tokens(),
                 })
 
             # Handle response
@@ -472,6 +492,18 @@ class AgentController:
                 temperature=0.2,
             )
             answer = response.content or "(No response from model)"
+
+            # Track token usage from /btw response
+            p_tokens = 0
+            c_tokens = 0
+            if response.usage:
+                p_tokens = response.usage.get("prompt_tokens", 0) or 0
+                c_tokens = response.usage.get("completion_tokens", 0) or 0
+            if not p_tokens:
+                p_tokens = sum(len(m.get("content", "")) for m in messages) // 4
+            if not c_tokens and response.content:
+                c_tokens = max(1, len(response.content) // 4)
+            self.context.add_token_usage(p_tokens, c_tokens)
         except Exception as e:
             logger.error(f"/btw direct model call failed: {e}")
             self.session_manager.log_error("BTW_ERROR", str(e), {"question": question})
@@ -487,6 +519,7 @@ class AgentController:
 
     def get_status(self) -> Dict[str, Any]:
         """Get current agent status."""
+        stats = self.context.get_token_stats()
         return {
             "running": self.running,
             "cancelled": self.cancelled,
@@ -494,6 +527,10 @@ class AgentController:
             "tool_calls": self.context.get_tool_calls_count(),
             "last_error": self.last_error,
             "queued_messages": len(self.message_queue),
+            "tokens_up": stats["tokens_up"],
+            "tokens_down": stats["tokens_down"],
+            "total_tokens": stats["total_tokens"],
+            "approx_context_tokens": stats["approx_context_tokens"],
         }
 
 
