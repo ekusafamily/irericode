@@ -263,7 +263,9 @@ async def _prompt_arrow_menu(
     title: str,
     options: List[Dict[str, Any]],
     hotkeys: Optional[Dict[str, str]] = None,
-    subtitle: str = "Use ↑/↓ arrows + Enter to select (or press shortcut key)",
+    subtitle: str = "Use ↑/↓ arrows + Enter to select (Esc to cancel)",
+    max_visible: int = 16,
+    initial_index: int = 0,
 ) -> Optional[str]:
     """Render an interactive arrow-key selection menu using prompt_toolkit.
 
@@ -271,6 +273,8 @@ async def _prompt_arrow_menu(
     """
     if not sys.stdin.isatty():
         raise RuntimeError("stdin is not a TTY")
+    if not options:
+        return None
 
     from prompt_toolkit.application import Application
     from prompt_toolkit.key_binding import KeyBindings
@@ -278,7 +282,7 @@ async def _prompt_arrow_menu(
     from prompt_toolkit.layout.controls import FormattedTextControl
     from prompt_toolkit.styles import Style
 
-    selected_idx = 0
+    selected_idx = max(0, min(initial_index, len(options) - 1))
     kb = KeyBindings()
 
     @kb.add("up")
@@ -314,11 +318,28 @@ async def _prompt_arrow_menu(
             lines.append(("class:title", f"  {title}\n"))
         if subtitle:
             lines.append(("class:subtitle", f"  {subtitle}\n"))
-        for idx, opt in enumerate(options):
+
+        total = len(options)
+        if total > max_visible:
+            half = max_visible // 2
+            start = max(0, min(selected_idx - half, total - max_visible))
+            end = start + max_visible
+        else:
+            start = 0
+            end = total
+
+        if start > 0:
+            lines.append(("class:subtitle", f"    ↑ {start} more above...\n"))
+
+        for idx in range(start, end):
+            opt = options[idx]
             is_sel = idx == selected_idx
             pointer = "  ❯ " if is_sel else "    "
             style_cls = "class:selected" if is_sel else opt.get("pt_style", "class:item")
             lines.append((style_cls, f"{pointer}{opt['label']}\n"))
+
+        if end < total:
+            lines.append(("class:subtitle", f"    ↓ {total - end} more below...\n"))
         return lines
 
     style = Style.from_dict({
@@ -621,7 +642,7 @@ async def _chat_async(
     for line in banner_lines:
         console.print(f"[bold bright_cyan]{line}[/bold bright_cyan]")
     console.print()
-    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.1.0[/bold bright_green]")
+    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.1.1[/bold bright_green]")
     console.print()
     key_status = "[green]Configured[/green]" if config.openai_api_key else "[yellow]Not set (/provider)[/yellow]"
     console.print(render_system_message(
@@ -881,7 +902,7 @@ async def _chat_async(
                         continue
 
                     if cleaned.lower().startswith("/queue"):
-                        _handle_queue_command(cleaned.split(), controller)
+                        await _handle_queue_command(cleaned.split(), controller)
                         continue
 
                     choice = cleaned.lower()
@@ -937,7 +958,7 @@ async def _chat_async(
 
                 # Handle /queue command
                 if user_input.lower().startswith("/queue"):
-                    _handle_queue_command(user_input.split(), controller)
+                    await _handle_queue_command(user_input.split(), controller)
                     continue
 
                 # Handle other slash commands
@@ -1227,16 +1248,18 @@ async def _handle_slash_command(command: str, controller: AgentController) -> No
         return True
 
     elif cmd == "/queue":
-        _handle_queue_command(parts, controller)
+        await _handle_queue_command(parts, controller)
         return True
 
     elif cmd == "/help":
-        _show_help()
+        selected_cmd = await _show_help_interactive()
+        if selected_cmd and selected_cmd != "/help":
+            return await _handle_slash_command(selected_cmd, controller)
         return True
 
     elif cmd == "/model":
         config = get_config()
-        await _show_models_command(config)
+        await _show_models_command(config, controller)
         return True
 
     elif cmd == "/models":
@@ -1294,6 +1317,17 @@ async def _handle_slash_command(command: str, controller: AgentController) -> No
         return True
 
     elif cmd == "/reset":
+        if sys.stdin.isatty() and len(parts) == 1:
+            confirm = await _prompt_arrow_menu(
+                title="Reset current conversation session?",
+                options=[
+                    {"key": "yes", "label": "✓ Yes, reset session", "pt_style": "class:deny"},
+                    {"key": "no", "label": "✗ Cancel", "pt_style": "class:item"},
+                ],
+            )
+            if confirm != "yes":
+                console.print("[dim]Session reset cancelled.[/dim]")
+                return True
         controller.reset()
         console.print(render_system_message("[green]Session reset.[/green]"))
         return True
@@ -1427,6 +1461,51 @@ async def _handle_ps_command(parts: list) -> None:
 
     console.print()
     console.print(table)
+
+    if sys.stdin.isatty():
+        while True:
+            procs = pm.list_processes()
+            if not procs:
+                break
+            menu_opts = []
+            for p in procs:
+                st = "RUNNING" if p.is_running else f"EXIT({p.returncode})"
+                menu_opts.append({
+                    "key": f"logs:{p.process_id}",
+                    "label": f"📜 View logs: {p.process_id} [{st}] {p.command[:40]}",
+                    "pt_style": "class:accent",
+                })
+                if p.is_running:
+                    menu_opts.append({
+                        "key": f"follow:{p.process_id}",
+                        "label": f"📡 Follow live: {p.process_id}",
+                        "pt_style": "class:allow",
+                    })
+                    menu_opts.append({
+                        "key": f"stop:{p.process_id}",
+                        "label": f"⏹ Stop process: {p.process_id}",
+                        "pt_style": "class:deny",
+                    })
+            if any(p.is_running for p in procs):
+                menu_opts.append({"key": "stop_all", "label": "⏹ Stop all running processes", "pt_style": "class:deny"})
+            menu_opts.append({"key": "done", "label": "← Done", "pt_style": "class:item"})
+
+            action = await _prompt_arrow_menu("Process Actions:", menu_opts)
+            if not action or action == "done":
+                break
+            if action == "stop_all":
+                count = pm.stop_all()
+                console.print(render_system_message(f"[yellow]Stopped {count} running process(es).[/yellow]"))
+            elif action.startswith("logs:"):
+                await _handle_logs_command(["/logs", action.split(":", 1)[1]])
+            elif action.startswith("follow:"):
+                await _handle_logs_command(["/logs", "follow", action.split(":", 1)[1]])
+            elif action.startswith("stop:"):
+                pid_target = action.split(":", 1)[1]
+                ok, msg = await pm.stop_process(pid_target)
+                console.print(render_system_message(f"[{'green' if ok else 'red'}]{msg}[/{'green' if ok else 'red'}]"))
+        return
+
     console.print(render_system_message(
         "[dim]Commands: [cyan]/logs <id>[/cyan] (view logs)  •  [cyan]/logs follow <id>[/cyan] (stream live)  •  [cyan]/ps stop <id>[/cyan] (stop)[/dim]"
     ))
@@ -1453,6 +1532,37 @@ async def _handle_logs_command(parts: list) -> None:
             tail = int(arg)
         elif not proc_id:
             proc_id = arg
+
+    if not args and sys.stdin.isatty():
+        procs = pm.list_processes()
+        if len(procs) > 1:
+            proc_opts = [
+                {
+                    "key": p.process_id,
+                    "label": f"{p.process_id} [{'RUNNING' if p.is_running else f'EXIT({p.returncode})'}] {p.command[:48]}",
+                    "pt_style": "class:allow" if p.is_running else "class:item",
+                }
+                for p in procs
+            ]
+            proc_opts.append({"key": "__cancel__", "label": "← Cancel", "pt_style": "class:item"})
+            picked = await _prompt_arrow_menu("Select process to view logs:", proc_opts)
+            if not picked or picked == "__cancel__":
+                return
+            proc_id = picked
+        if procs:
+            picked_proc = pm.get_process(proc_id)
+            if picked_proc and picked_proc.is_running:
+                mode = await _prompt_arrow_menu(
+                    f"Logs for {picked_proc.process_id}:",
+                    [
+                        {"key": "recent", "label": "📜 View recent logs (last 80 lines)", "pt_style": "class:accent"},
+                        {"key": "follow", "label": "📡 Follow live logs (stream)", "pt_style": "class:allow"},
+                        {"key": "cancel", "label": "← Cancel", "pt_style": "class:item"},
+                    ],
+                )
+                if not mode or mode == "cancel":
+                    return
+                follow = (mode == "follow")
 
     proc = pm.get_process(proc_id)
     if not proc:
@@ -1550,7 +1660,7 @@ async def _handle_btw_command(question: str, controller: AgentController) -> Non
     console.print()
 
 
-def _handle_queue_command(parts: list, controller: AgentController) -> None:
+async def _handle_queue_command(parts: list, controller: AgentController) -> None:
     """Handle /queue slash command to view, add, or clear queued messages."""
     sub = parts[1].lower() if len(parts) > 1 else ""
 
@@ -1576,27 +1686,39 @@ def _handle_queue_command(parts: list, controller: AgentController) -> None:
     if not queued:
         console.print(render_system_message(
             "[dim]Message queue is currently empty.\n"
-            "Queue upcoming tasks with [bold cyan]/queue <message>[/bold cyan] or while running.\n"
-            "They will automatically execute in order after the active task finishes.[/dim]"
+            "Queue upcoming tasks with [bold cyan]/queue <message>[/bold cyan] or while running.[/dim]"
         ))
-        return
+    else:
+        table = Table(title=f"Queued Messages ({len(queued)} pending)", box=ROUNDED, border_style="cyan")
+        table.add_column("#", style="dim", width=4)
+        table.add_column("Queued Task", style="white")
 
-    table = Table(title=f"Queued Messages ({len(queued)} pending)", box=ROUNDED, border_style="cyan")
-    table.add_column("#", style="dim", width=4)
-    table.add_column("Queued Task", style="white")
+        for idx, msg in enumerate(queued, 1):
+            preview = msg.replace("\n", " ")
+            if len(preview) > 85:
+                preview = preview[:82] + "..."
+            table.add_row(str(idx), preview)
 
-    for idx, msg in enumerate(queued, 1):
-        preview = msg.replace("\n", " ")
-        if len(preview) > 85:
-            preview = preview[:82] + "..."
-        table.add_row(str(idx), preview)
+        console.print()
+        console.print(table)
 
-    console.print()
-    console.print(table)
-    console.print(render_system_message(
-        "[dim]These tasks will automatically run in sequence after the current task finishes.\n"
-        "Use [bold cyan]/queue add <task>[/bold cyan] to queue more, or [bold cyan]/queue clear[/bold cyan] to remove all.[/dim]"
-    ))
+    if sys.stdin.isatty() and not sub:
+        opts = [{"key": "add", "label": "+ Add a task to queue", "pt_style": "class:allow"}]
+        if queued:
+            opts.append({"key": "clear", "label": "✕ Clear all queued tasks", "pt_style": "class:deny"})
+        opts.append({"key": "done", "label": "← Done", "pt_style": "class:item"})
+        action = await _prompt_arrow_menu("Queue Actions:", opts)
+        if action == "add":
+            loop = asyncio.get_event_loop()
+            new_msg = (await loop.run_in_executor(
+                None, lambda: Prompt.ask("[bold cyan]Task to queue[/bold cyan]", default="")
+            )).strip()
+            if new_msg:
+                q_len = controller.queue_message(new_msg)
+                console.print(render_system_message(f"[green]✓ Queued task #{q_len}:[/green] [white]{new_msg}[/white]"))
+        elif action == "clear":
+            count = controller.clear_message_queue()
+            console.print(render_system_message(f"[green]Cleared {count} queued message(s).[/green]"))
     console.print()
 
 
@@ -1926,66 +2048,84 @@ async def _handle_tools_settings_command(args: list, controller: Optional[AgentC
 
 
 async def _interactive_config_edit(controller: Optional[AgentController] = None) -> None:
-    """Interactive wizard to change any configuration setting."""
-    config = get_config()
-    console.print()
-    console.print("[bold bright_cyan]Interactive Configuration Editor[/bold bright_cyan]")
-    console.print(f"  [bold]1[/bold]) Max Iterations     [dim](current: {config.max_iterations})[/dim]")
-    console.print(f"  [bold]2[/bold]) Max Tool Calls     [dim](current: {config.max_tool_calls})[/dim]")
-    console.print(f"  [bold]3[/bold]) Command Timeout    [dim](current: {config.command_timeout}s)[/dim]")
-    console.print(f"  [bold]4[/bold]) Model              [dim](current: {config.openai_model})[/dim]")
-    console.print(f"  [bold]5[/bold]) Base URL           [dim](current: {config.openai_base_url})[/dim]")
-    console.print(f"  [bold]6[/bold]) API Key            [dim](current: {('***' + config.openai_api_key[-4:]) if config.openai_api_key else 'Not set'})[/dim]")
-    console.print(f"  [bold]7[/bold]) Log Level          [dim](current: {config.log_level})[/dim]")
-    console.print(f"  [bold]8[/bold]) Tool Access        [dim]({len(config.tool_access)} custom rule(s))[/dim]")
-    console.print("  [bold]0[/bold]) Cancel")
+    """Interactive arrow-key wizard to change any configuration setting."""
+    while True:
+        config = get_config()
+        key_preview = ("***" + config.openai_api_key[-4:]) if config.openai_api_key else "Not set"
+        options = [
+            {"key": "max_iterations", "label": f"Max Iterations     ({config.max_iterations})", "pt_style": "class:item"},
+            {"key": "max_tool_calls", "label": f"Max Tool Calls     ({config.max_tool_calls})", "pt_style": "class:item"},
+            {"key": "command_timeout", "label": f"Command Timeout    ({config.command_timeout}s)", "pt_style": "class:item"},
+            {"key": "model", "label": f"Model              ({config.openai_model})", "pt_style": "class:accent"},
+            {"key": "base_url", "label": f"Base URL           ({config.openai_base_url})", "pt_style": "class:accent"},
+            {"key": "api_key", "label": f"API Key            ({key_preview})", "pt_style": "class:accent"},
+            {"key": "log_level", "label": f"Log Level          ({config.log_level})", "pt_style": "class:item"},
+            {"key": "tool_access", "label": f"Tool Access        ({len(config.tool_access)} custom rule(s))", "pt_style": "class:allow"},
+            {"key": "done", "label": "← Back / Done", "pt_style": "class:item"},
+        ]
 
-    import asyncio
-    loop = asyncio.get_event_loop()
-    choice = await loop.run_in_executor(
-        None,
-        lambda: Prompt.ask("[bold cyan]Select setting to edit[/bold cyan]", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8"], default="1")
-    )
+        if sys.stdin.isatty():
+            choice = await _prompt_arrow_menu("Interactive Configuration Editor", options)
+        else:
+            choice = None
 
-    if choice == "0":
-        console.print("[dim]Edit cancelled.[/dim]")
-        return
+        if not choice or choice == "done":
+            return
 
-    if choice == "8":
-        await _interactive_tool_access_edit(controller)
-        return
+        if choice == "tool_access":
+            await _interactive_tool_access_edit(controller)
+            continue
 
-    mapping = {
-        "1": ("max_iterations", str(config.max_iterations)),
-        "2": ("max_tool_calls", str(config.max_tool_calls)),
-        "3": ("command_timeout", str(config.command_timeout)),
-        "4": ("model", config.openai_model),
-        "5": ("base_url", config.openai_base_url),
-        "6": ("api_key", ""),
-        "7": ("log_level", config.log_level),
-    }
+        defaults = {
+            "max_iterations": str(config.max_iterations),
+            "max_tool_calls": str(config.max_tool_calls),
+            "command_timeout": str(config.command_timeout),
+            "model": config.openai_model,
+            "base_url": config.openai_base_url,
+            "api_key": "",
+            "log_level": config.log_level,
+        }
 
-    setting_key, default_val = mapping[choice]
-    new_val = await loop.run_in_executor(
-        None,
-        lambda: Prompt.ask(f"[bold cyan]Enter new value for {setting_key}[/bold cyan]", default=default_val)
-    )
+        loop = asyncio.get_event_loop()
+        new_val = await loop.run_in_executor(
+            None,
+            lambda: Prompt.ask(f"[bold cyan]Enter new value for {choice}[/bold cyan]", default=defaults[choice]),
+        )
 
-    if not new_val.strip():
-        console.print("[yellow]No change made.[/yellow]")
-        return
+        if not new_val.strip():
+            console.print("[yellow]No change made.[/yellow]")
+            continue
 
-    ok, msg = set_config_value(setting_key, new_val.strip(), controller)
-    if ok:
-        console.print(render_system_message(f"[green]{msg}[/green]"))
-    else:
-        console.print(render_system_message(f"[red]{msg}[/red]"))
+        ok, msg = set_config_value(choice, new_val.strip(), controller)
+        if ok:
+            console.print(render_system_message(f"[green]{msg}[/green]"))
+        else:
+            console.print(render_system_message(f"[red]{msg}[/red]"))
 
 
 async def _handle_config_command(parts: list, controller: Optional[AgentController] = None) -> None:
     """Handle /config slash command and its subcommands."""
     if len(parts) == 1:
         _show_config_table(get_config())
+        if sys.stdin.isatty():
+            action = await _prompt_arrow_menu(
+                "Configuration Actions:",
+                [
+                    {"key": "edit", "label": "⚙ Edit a setting", "pt_style": "class:accent"},
+                    {"key": "tools", "label": "🛡 Edit tool access", "pt_style": "class:allow"},
+                    {"key": "reset", "label": "↺ Reset limits to defaults (1000 / 1000 / 60s)", "pt_style": "class:deny"},
+                    {"key": "done", "label": "← Done", "pt_style": "class:item"},
+                ],
+            )
+            if action == "edit":
+                await _interactive_config_edit(controller)
+            elif action == "tools":
+                await _interactive_tool_access_edit(controller)
+            elif action == "reset":
+                set_config_value("max_iterations", 1000, controller)
+                set_config_value("max_tool_calls", 1000, controller)
+                set_config_value("command_timeout", 60, controller)
+                console.print(render_system_message("[green]Reset iterations, tool calls, and timeout to defaults (1000 / 1000 / 60s).[/green]"))
         return
 
     sub = parts[1].lower()
@@ -2078,7 +2218,72 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
         await _handle_tools_settings_command(parts[2:], controller)
         return
 
-    if not subcommand or subcommand == "list":
+    if not subcommand:
+        if sys.stdin.isatty():
+            while True:
+                config = get_config()
+                profiles = get_profiles()
+                key_preview = ("***" + config.openai_api_key[-4:]) if config.openai_api_key else "Not set"
+                console.print()
+                console.print(Panel(
+                    f"[bold bright_green]Active Model:[/bold bright_green] [cyan]{config.openai_model}[/cyan]  •  "
+                    f"[bold bright_green]API Key:[/bold bright_green] [dim]{key_preview}[/dim]\n"
+                    f"[bold bright_green]Base URL:[/bold bright_green] [dim]{config.openai_base_url}[/dim]",
+                    title="[bold bright_blue]AI Provider & Settings[/bold bright_blue]",
+                    border_style="bright_blue",
+                    box=ROUNDED,
+                    padding=(0, 2),
+                ))
+
+                menu_opts = []
+                for pname, prof in profiles.items():
+                    is_active = (
+                        prof.get("api_key") == config.openai_api_key
+                        and prof.get("base_url") == config.openai_base_url
+                    )
+                    pmodel = prof.get("model") or "default"
+                    menu_opts.append({
+                        "key": f"use:{pname}",
+                        "label": f"{'★ ' if is_active else '→ '}Switch to '{pname}' ({pmodel})" + (" [Active]" if is_active else ""),
+                        "pt_style": "class:allow" if is_active else "class:accent",
+                    })
+
+                menu_opts.extend([
+                    {"key": "add_nvidia", "label": "★ Add / Update NVIDIA NIM Preset (Free Tier — only API key)", "pt_style": "class:allow"},
+                    {"key": "add_wizard", "label": "+ Add Provider (NVIDIA, OpenAI, OpenRouter, Groq, Custom)", "pt_style": "class:accent"},
+                    {"key": "model", "label": "◈ Switch Model (/model)", "pt_style": "class:item"},
+                    {"key": "tools", "label": "🛡 Edit Tool Access (/settings tools)", "pt_style": "class:item"},
+                    {"key": "edit", "label": "⚙ Edit Settings (/settings edit)", "pt_style": "class:item"},
+                ])
+                if profiles:
+                    menu_opts.append({"key": "delete", "label": "✕ Delete a Saved Profile", "pt_style": "class:deny"})
+                menu_opts.append({"key": "done", "label": "← Done", "pt_style": "class:item"})
+
+                action = await _prompt_arrow_menu("Provider & Settings Menu:", menu_opts)
+                if not action or action == "done":
+                    return
+                if action.startswith("use:"):
+                    pname = action.split(":", 1)[1]
+                    if load_profile(pname):
+                        reset_model_client()
+                        controller.model_client = get_model_client()
+                        console.print(render_system_message(f"[green]✓ Switched active provider to '{pname}'.[/green]"))
+                elif action == "add_nvidia":
+                    await _handle_provider_command(["/provider", "nvidia"], controller)
+                elif action == "add_wizard":
+                    await _handle_provider_command(["/provider", "add"], controller)
+                elif action == "model":
+                    await _show_models_command(get_config(), controller)
+                elif action == "tools":
+                    await _interactive_tool_access_edit(controller)
+                elif action == "edit":
+                    await _interactive_config_edit(controller)
+                elif action == "delete":
+                    await _handle_provider_command(["/provider", "delete"], controller)
+            return
+        subcommand = "list"
+
+    if subcommand == "list":
         config = get_config()
         profiles = get_profiles()
 
@@ -2173,20 +2378,35 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
         return
 
     elif subcommand == "add":
+        from agent.config import NVIDIA_NIM_BASE_URL, NVIDIA_NIM_DEFAULT_MODEL, sync_api_credentials
         name = parts[2] if len(parts) > 2 else ""
 
         if not name:
-            console.print()
-            console.print("[bold cyan]Select provider template:[/bold cyan]")
-            console.print("  [bold]1[/bold]) NVIDIA NIM ([green]Recommended Free Tier[/green] - https://build.nvidia.com/)")
-            console.print("  [bold]2[/bold]) OpenAI (https://api.openai.com/v1)")
-            console.print("  [bold]3[/bold]) OpenRouter (https://openrouter.ai/api/v1)")
-            console.print("  [bold]4[/bold]) Groq (https://api.groq.com/openai/v1)")
-            console.print("  [bold]5[/bold]) Custom OpenAI-compatible URL")
-            choice = Prompt.ask("[bold cyan]Choice[/bold cyan]", choices=["1", "2", "3", "4", "5"], default="1")
+            if sys.stdin.isatty():
+                choice = await _prompt_arrow_menu(
+                    title="Select Provider Template:",
+                    options=[
+                        {"key": "1", "label": "★ NVIDIA NIM (Recommended Free Tier — build.nvidia.com)", "pt_style": "class:allow"},
+                        {"key": "2", "label": "OpenAI (https://api.openai.com/v1)", "pt_style": "class:accent"},
+                        {"key": "3", "label": "OpenRouter (https://openrouter.ai/api/v1)", "pt_style": "class:accent"},
+                        {"key": "4", "label": "Groq (https://api.groq.com/openai/v1)", "pt_style": "class:accent"},
+                        {"key": "5", "label": "Custom OpenAI-compatible URL", "pt_style": "class:item"},
+                        {"key": "cancel", "label": "← Cancel", "pt_style": "class:item"},
+                    ],
+                )
+                if not choice or choice == "cancel":
+                    return
+            else:
+                console.print()
+                console.print("[bold cyan]Select provider template:[/bold cyan]")
+                console.print("  [bold]1[/bold]) NVIDIA NIM ([green]Recommended Free Tier[/green] - https://build.nvidia.com/)")
+                console.print("  [bold]2[/bold]) OpenAI (https://api.openai.com/v1)")
+                console.print("  [bold]3[/bold]) OpenRouter (https://openrouter.ai/api/v1)")
+                console.print("  [bold]4[/bold]) Groq (https://api.groq.com/openai/v1)")
+                console.print("  [bold]5[/bold]) Custom OpenAI-compatible URL")
+                choice = Prompt.ask("[bold cyan]Choice[/bold cyan]", choices=["1", "2", "3", "4", "5"], default="1")
 
             if choice == "1":
-                from agent.config import NVIDIA_NIM_BASE_URL, NVIDIA_NIM_DEFAULT_MODEL
                 name = "nvidia"
                 default_url = NVIDIA_NIM_BASE_URL
                 default_model = NVIDIA_NIM_DEFAULT_MODEL
@@ -2209,7 +2429,6 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
                 default_model = "gpt-4o-mini"
         else:
             if name.lower() == "nvidia":
-                from agent.config import NVIDIA_NIM_BASE_URL, NVIDIA_NIM_DEFAULT_MODEL
                 default_url = NVIDIA_NIM_BASE_URL
                 default_model = NVIDIA_NIM_DEFAULT_MODEL
                 console.print("[dim]Register for free key: https://build.nvidia.com/[/dim]")
@@ -2228,8 +2447,20 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
         save_profile(name, api_key, base_url, model)
         console.print(f"[green]Profile '{name}' saved.[/green]")
 
-        if Confirm.ask(f"Set '{name}' as active profile?", default=True):
-            load_profile(name)
+        if sys.stdin.isatty():
+            activate = await _prompt_arrow_menu(
+                title=f"Set '{name}' as active provider now?",
+                options=[
+                    {"key": "yes", "label": f"✓ Yes, activate '{name}' now", "pt_style": "class:allow"},
+                    {"key": "no", "label": "Keep current active provider", "pt_style": "class:item"},
+                ],
+            )
+            should_activate = (activate == "yes")
+        else:
+            should_activate = Confirm.ask(f"Set '{name}' as active profile?", default=True)
+
+        if should_activate:
+            sync_api_credentials(api_key=api_key, base_url=base_url, model=model, profile_name=name)
             reset_model_client()
             controller.model_client = get_model_client()
             console.print(render_system_message(f"[green]Active profile set to '{name}'.[/green]"))
@@ -2237,10 +2468,22 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
 
     elif subcommand == "delete":
         if len(parts) < 3:
-            console.print("[red]Usage: /provider delete <name>[/red]")
-            return
+            profiles = get_profiles()
+            if sys.stdin.isatty() and profiles:
+                del_opts = [
+                    {"key": pname, "label": f"✕ Delete '{pname}' ({prof.get('base_url', '')})", "pt_style": "class:deny"}
+                    for pname, prof in profiles.items()
+                ]
+                del_opts.append({"key": "__cancel__", "label": "← Cancel", "pt_style": "class:item"})
+                name = await _prompt_arrow_menu("Select profile to delete:", del_opts)
+                if not name or name == "__cancel__":
+                    return
+            else:
+                console.print("[red]Usage: /provider delete <name>[/red]")
+                return
+        else:
+            name = parts[2]
 
-        name = parts[2]
         if delete_profile(name):
             console.print(f"[green]Profile '{name}' deleted.[/green]")
         else:
@@ -2249,10 +2492,21 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
 
     elif subcommand == "use":
         if len(parts) < 3:
-            console.print("[red]Usage: /provider use <name>[/red]")
-            return
-
-        name = parts[2]
+            profiles = get_profiles()
+            if sys.stdin.isatty() and profiles:
+                use_opts = [
+                    {"key": pname, "label": f"→ Switch to '{pname}' ({prof.get('model') or 'default'})", "pt_style": "class:accent"}
+                    for pname, prof in profiles.items()
+                ]
+                use_opts.append({"key": "__cancel__", "label": "← Cancel", "pt_style": "class:item"})
+                name = await _prompt_arrow_menu("Select profile to activate:", use_opts)
+                if not name or name == "__cancel__":
+                    return
+            else:
+                console.print("[red]Usage: /provider use <name>[/red]")
+                return
+        else:
+            name = parts[2]
         if load_profile(name):
             reset_model_client()
             controller.model_client = get_model_client()
@@ -2578,63 +2832,74 @@ def init(
     console.print()
 
 
-async def _show_models_command(config: AgentConfig) -> None:
-    """Handle /model command - fetch and switch models."""
+async def _show_models_command(config: AgentConfig, controller: Optional[AgentController] = None) -> None:
+    """Handle /model command - fetch and switch models interactively with arrow keys."""
     from agent.config import update_config
-    from agent.model import reset_model_client
+    from agent.model import get_model_client, reset_model_client
     console.print("[dim]Fetching available models...[/dim]")
 
     try:
         models = await _fetch_models(config.openai_base_url, config.openai_api_key)
 
         if not models:
-            console.print("[yellow]No models found or error fetching models[/yellow]")
+            console.print("[yellow]No models found or error fetching models.[/yellow]")
+            if sys.stdin.isatty():
+                loop = asyncio.get_event_loop()
+                manual = (await loop.run_in_executor(
+                    None,
+                    lambda: Prompt.ask("[bold cyan]Enter model ID manually (Enter to cancel)[/bold cyan]", default=""),
+                )).strip()
+                if manual:
+                    update_config(openai_model=manual)
+                    reset_model_client()
+                    if controller:
+                        controller.model_client = get_model_client()
+                    console.print(render_system_message(f"[green]Model changed to: {manual}[/green]"))
             return
 
-        # Display models in a table
-        table = Table(title="Available Models")
-        table.add_column("#", style="cyan", width=4)
-        table.add_column("Model ID", style="white")
-        table.add_column("Created", style="dim")
-        table.add_column("Owned By", style="dim")
-
-        for i, model in enumerate(models, 1):
-            created = model.get("created", "")
-            if created:
-                from datetime import datetime
-                created = datetime.fromtimestamp(created).strftime("%Y-%m-%d")
-            table.add_row(
-                str(i),
-                model.get("id", "unknown"),
-                created,
-                model.get("owned_by", "unknown")
+        selected_model: Optional[str] = None
+        if sys.stdin.isatty():
+            initial_idx = 0
+            menu_opts = []
+            for idx, m in enumerate(models):
+                mid = m.get("id", "unknown")
+                is_cur = mid == config.openai_model
+                if is_cur:
+                    initial_idx = idx
+                menu_opts.append({
+                    "key": mid,
+                    "label": f"{'★ ' if is_cur else '  '}{mid}" + ("  [active]" if is_cur else ""),
+                    "pt_style": "class:allow" if is_cur else "class:item",
+                })
+            selected_model = await _prompt_arrow_menu(
+                title=f"Select Model ({len(models)} available):",
+                options=menu_opts,
+                initial_index=initial_idx,
             )
-
-        console.print(table)
-
-        # Prompt for selection
-        choice = Prompt.ask(
-            "[bold cyan]Select model number[/bold cyan]",
-            default="1"
-        )
-
-        try:
+        else:
+            table = Table(title="Available Models")
+            table.add_column("#", style="cyan", width=4)
+            table.add_column("Model ID", style="white")
+            table.add_column("Owned By", style="dim")
+            for i, model in enumerate(models, 1):
+                table.add_row(str(i), model.get("id", "unknown"), model.get("owned_by", "unknown"))
+            console.print(table)
+            choice = Prompt.ask("[bold cyan]Select model number[/bold cyan]", default="1")
             idx = int(choice) - 1
             if 0 <= idx < len(models):
                 selected_model = models[idx]["id"]
-                update_config(openai_model=selected_model)
-                reset_model_client()
 
-                console.print(Panel(
-                    f"Model changed to: [green]{selected_model}[/green]\n"
-                    f"Saved to global config (~/.ireri-code/config.json)",
-                    title="[bold green]Model Updated[/bold green]",
-                    border_style="green",
-                ))
-            else:
-                console.print("[red]Invalid selection[/red]")
-        except ValueError:
-            console.print("[red]Invalid input[/red]")
+        if selected_model:
+            update_config(openai_model=selected_model)
+            reset_model_client()
+            if controller:
+                controller.model_client = get_model_client()
+            console.print(Panel(
+                f"Model changed to: [green]{selected_model}[/green]\n"
+                f"Saved to global config (~/.ireri-code/config.json)",
+                title="[bold green]Model Updated[/bold green]",
+                border_style="green",
+            ))
 
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
@@ -2675,6 +2940,30 @@ async def _show_models_list(config: AgentConfig) -> None:
 
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
+
+
+async def _show_help_interactive() -> Optional[str]:
+    """Interactive arrow-key command browser for /help (falls back to table if non-TTY)."""
+    if not sys.stdin.isatty():
+        _show_help()
+        return None
+
+    options = [{"key": "__close__", "label": "← Close Help", "pt_style": "class:item"}]
+    for cmd, desc in SLASH_COMMANDS.items():
+        icon = SLASH_COMMAND_ICONS.get(cmd, "✦")
+        options.append({
+            "key": cmd,
+            "label": f"{icon} {cmd:<11} {desc[:58]}",
+            "pt_style": "class:accent",
+        })
+
+    picked = await _prompt_arrow_menu(
+        title="ireri Slash Commands (select a command to run it):",
+        options=options,
+    )
+    if not picked or picked == "__close__":
+        return None
+    return picked
 
 
 def _show_help() -> None:
@@ -2770,7 +3059,7 @@ def _show_config_command() -> None:
 def _show_version_command() -> None:
     """Handle /version command."""
     console.print(Panel(
-        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.1.0[/bright_green]\n"
+        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.1.1[/bright_green]\n"
         "Terminal AI Coding Agent\n"
         "https://github.com/ekusafamily/ireri-code",
         title="[bold]Version Info[/bold]",

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ireri-code"
-version = "2.1.0"
+version = "2.1.1"
 description = "IRERI CODE - Terminal AI Coding Agent"
 readme = "README.md"
 license = {text = "MIT"}
