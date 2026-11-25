@@ -296,24 +296,37 @@ class AgentController:
                             )
                             logger.warning(f"Tool {tool_call['function']['name']} failed: {result.error}")
 
-                            # Build comprehensive error report so the model can take appropriate corrective actions
-                            diag_parts = [f"[TOOL ERROR in {tool_call['function']['name']}]: {self.last_error}"]
-                            if isinstance(result.output, dict):
-                                if result.output.get("stdout") and result.output.get("stdout").strip() != self.last_error.strip():
-                                    diag_parts.append(f"Command stdout:\n{result.output['stdout'].strip()}")
-                                if result.output.get("stderr") and result.output.get("stderr").strip() != self.last_error.strip():
-                                    diag_parts.append(f"Command stderr:\n{result.output['stderr'].strip()}")
-                                if "returncode" in result.output and result.output["returncode"] != 0:
-                                    diag_parts.append(f"Exit code: {result.output['returncode']}")
-                            elif result.output:
-                                diag_parts.append(f"Output: {result.output}")
-
-                            diag_parts.append(
-                                "AUTOMATIC ACTION REQUIRED: An error occurred during this action. "
-                                "Analyze this error, identify the root cause, and take appropriate corrective actions "
-                                "automatically (e.g. fix parameters, correct code syntax/logic, inspect files, or try an alternative approach)."
+                            denial_feedback = (
+                                result.metadata.get("denial_feedback")
+                                if isinstance(result.metadata, dict)
+                                else None
                             )
-                            tool_out_str = "\n\n".join(diag_parts)
+                            if isinstance(result.metadata, dict) and result.metadata.get("denied") and denial_feedback:
+                                tool_out_str = (
+                                    f"[TOOL DENIED BY USER in {tool_call['function']['name']}]: "
+                                    f"The user denied permission for this tool call.\n\n"
+                                    f"User instruction: {denial_feedback}\n\n"
+                                    f"Follow the user's instruction above."
+                                )
+                            else:
+                                # Build comprehensive error report so the model can take appropriate corrective actions
+                                diag_parts = [f"[TOOL ERROR in {tool_call['function']['name']}]: {self.last_error}"]
+                                if isinstance(result.output, dict):
+                                    if result.output.get("stdout") and result.output.get("stdout").strip() != self.last_error.strip():
+                                        diag_parts.append(f"Command stdout:\n{result.output['stdout'].strip()}")
+                                    if result.output.get("stderr") and result.output.get("stderr").strip() != self.last_error.strip():
+                                        diag_parts.append(f"Command stderr:\n{result.output['stderr'].strip()}")
+                                    if "returncode" in result.output and result.output["returncode"] != 0:
+                                        diag_parts.append(f"Exit code: {result.output['returncode']}")
+                                elif result.output:
+                                    diag_parts.append(f"Output: {result.output}")
+
+                                diag_parts.append(
+                                    "AUTOMATIC ACTION REQUIRED: An error occurred during this action. "
+                                    "Analyze this error, identify the root cause, and take appropriate corrective actions "
+                                    "automatically (e.g. fix parameters, correct code syntax/logic, inspect files, or try an alternative approach)."
+                                )
+                                tool_out_str = "\n\n".join(diag_parts)
                         else:
                             tool_out_str = json.dumps(result.output) if isinstance(result.output, (dict, list)) else str(result.output)
 
@@ -417,13 +430,20 @@ class AgentController:
             )
 
         if policy == "ask":
-            approved = await self._request_approval(tool_name, args_dict, tool.dangerous)
+            approved, feedback = await self._request_approval_with_feedback(tool_name, args_dict, tool.dangerous)
             if not approved:
                 if self.progress_callback:
-                    self.progress_callback("tool_denied", {"tool": tool_name})
+                    self.progress_callback("tool_denied", {"tool": tool_name, "feedback": feedback})
+                if feedback:
+                    return ToolResult(
+                        success=False,
+                        error=f"User denied approval. User instruction: {feedback}",
+                        metadata={"denied": True, "denial_feedback": feedback},
+                    )
                 return ToolResult(
                     success=False,
-                    error="User denied approval"
+                    error="User denied approval",
+                    metadata={"denied": True},
                 )
 
         # Execute tool
@@ -457,21 +477,30 @@ class AgentController:
                 })
             return ToolResult(success=False, error=str(e))
 
+    async def _request_approval_with_feedback(
+        self, tool_name: str, args: Dict[str, Any], dangerous: bool = False
+    ) -> tuple[bool, Optional[str]]:
+        """Request user approval for a tool call, returning (approved, optional_feedback)."""
+        if self._approve_all:
+            return True, None
+        if self._deny_all:
+            return False, None
+
+        if self.approval_callback:
+            decision = await self.approval_callback(tool_name, args, dangerous)
+            if isinstance(decision, tuple):
+                approved = bool(decision[0])
+                feedback = str(decision[1]).strip() if len(decision) > 1 and decision[1] else None
+                return approved, (feedback or None)
+            return bool(decision), None
+
+        logger.info(f"Approval requested for {tool_name}: {args}")
+        return True, None
+
     async def _request_approval(self, tool_name: str, args: Dict[str, Any], dangerous: bool = False) -> bool:
         """Request user approval for a tool call."""
-        # Check session-level approvals first
-        if self._approve_all:
-            return True
-        if self._deny_all:
-            return False
-
-        # If we have an approval callback, use it
-        if self.approval_callback:
-            return await self.approval_callback(tool_name, args, dangerous)
-
-        # Fallback: auto-approve in non-interactive mode
-        logger.info(f"Approval requested for {tool_name}: {args}")
-        return True  # Auto-approve for now
+        approved, _ = await self._request_approval_with_feedback(tool_name, args, dangerous)
+        return approved
 
     def set_approve_all(self, value: bool) -> None:
         """Set approve-all mode for the session."""

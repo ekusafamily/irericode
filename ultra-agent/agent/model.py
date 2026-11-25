@@ -99,11 +99,8 @@ class ModelClient:
         self.model = model if model is not None else config.openai_model
         self.timeout = timeout
 
-        if not self.api_key:
-            raise ValueError("API key is required. Set OPENAI_API_KEY in .env")
-
         self.client = AsyncOpenAI(
-            api_key=self.api_key,
+            api_key=self.api_key or "not-configured",
             base_url=self.base_url,
             timeout=self.timeout,
         )
@@ -116,7 +113,7 @@ class ModelClient:
         logger.info(f"Reloading AsyncOpenAI client connection pool for {self.model} @ {self.base_url}")
         try:
             self.client = AsyncOpenAI(
-                api_key=self.api_key,
+                api_key=self.api_key or "not-configured",
                 base_url=self.base_url,
                 timeout=self.timeout,
             )
@@ -136,6 +133,9 @@ class ModelClient:
         progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> ModelResponse:
         """Send a chat completion request with incremental retry delay and 3-min timeout recovery."""
+        if not self.api_key:
+            raise ValueError("API key is not configured. Run /provider or /settings to set your API key.")
+
         delays = retry_delays if retry_delays is not None else RETRY_DELAYS
         cb = progress_callback or self.progress_callback
         total_attempts = len(delays) + 1

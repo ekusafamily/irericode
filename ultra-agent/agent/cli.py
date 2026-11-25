@@ -174,7 +174,11 @@ def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["Thi
     elif event == "tool_denied":
         if thinking:
             thinking.stop()
-        console.print(f"  [yellow]DENIED[/yellow] {data['tool']} denied\n")
+        feedback = data.get("feedback")
+        if feedback:
+            console.print(f"  [yellow]DENIED[/yellow] {data['tool']} denied — [cyan]instruction sent: {feedback}[/cyan]\n")
+        else:
+            console.print(f"  [yellow]DENIED[/yellow] {data['tool']} denied\n")
     elif event == "model_error":
         if thinking:
             thinking.stop()
@@ -337,15 +341,29 @@ async def _prompt_arrow_menu(
     return await app.run_async()
 
 
+async def _ask_denial_feedback() -> Optional[str]:
+    """Optionally ask the user what the agent should do instead after denying a tool."""
+    loop = asyncio.get_event_loop()
+    feedback = await loop.run_in_executor(
+        None,
+        lambda: Prompt.ask(
+            "[dim cyan]Tell the agent what to do instead (optional, press Enter to skip)[/dim cyan]",
+            default="",
+        ),
+    )
+    cleaned = feedback.strip()
+    return cleaned or None
+
+
 async def _prompt_tool_approval_interactive(
     tool_name: str,
     args: Dict[str, Any],
     dangerous: bool,
     controller: AgentController,
-) -> Optional[bool]:
+) -> tuple[bool, Optional[str]]:
     """Interactive arrow-key selector for tool approval.
 
-    Returns True (approved), False (denied), or raises RuntimeError if TTY is unavailable.
+    Returns (approved, optional_feedback), or raises RuntimeError if TTY is unavailable.
     """
     from agent.config import _save_global_config
 
@@ -381,30 +399,36 @@ async def _prompt_tool_approval_interactive(
             hotkeys=hotkeys,
         )
 
-        if choice is None or choice == "deny_once":
+        if choice is None:
             console.print("  [red]✗ Denied[/red]")
-            return False
+            return False, None
+        elif choice == "deny_once":
+            console.print("  [red]✗ Denied[/red]")
+            feedback = await _ask_denial_feedback()
+            return False, feedback
         elif choice == "approve_once":
             console.print("  [green]✓ Approved[/green]")
-            return True
+            return True, None
         elif choice == "always_allow":
             controller.config.set_tool_access(tool_name, "allow")
             _save_global_config(controller.config)
             console.print(render_system_message(f"[green]✓ Always allowing '{tool_name}' (saved to /settings)[/green]"))
-            return True
+            return True, None
         elif choice == "always_deny":
             controller.config.set_tool_access(tool_name, "deny")
             _save_global_config(controller.config)
             console.print(render_system_message(f"[red]⊘ Tool '{tool_name}' set to deny (saved to /settings)[/red]"))
-            return False
+            feedback = await _ask_denial_feedback()
+            return False, feedback
         elif choice == "approve_all":
             controller.set_approve_all(True)
             console.print(render_system_message("[green]✓✓ Approved all future tool calls for this session[/green]"))
-            return True
+            return True, None
         elif choice == "deny_all":
             controller.set_deny_all(True)
             console.print(render_system_message("[red]✗✗ Denied all future tool calls for this session[/red]"))
-            return False
+            feedback = await _ask_denial_feedback()
+            return False, feedback
         elif choice == "chat":
             loop = asyncio.get_event_loop()
             msg = await loop.run_in_executor(
@@ -426,6 +450,120 @@ async def _prompt_tool_approval_interactive(
             # Loop back to the approval selector
 
 
+async def _run_first_time_setup(config: AgentConfig) -> None:
+    """Beginner-friendly first-run onboarding when no API key is configured."""
+    from agent.config import (
+        NVIDIA_NIM_BASE_URL,
+        NVIDIA_NIM_DEFAULT_MODEL,
+        sync_api_credentials,
+    )
+
+    console.print()
+    console.print(Panel(
+        "[bold bright_cyan]Welcome to IRERI CODE![/bold bright_cyan]\n"
+        "No API key is configured yet. Let's set up your AI provider in seconds\n"
+        "(or skip and configure later using [cyan]/provider[/cyan]).\n\n"
+        "[bold bright_yellow]★ Recommended for Beginners: NVIDIA NIM (Free Tier)[/bold bright_yellow]\n"
+        "• Free API credits at [underline cyan]https://build.nvidia.com/[/underline cyan]\n"
+        f"• Preset Base URL: [dim]{NVIDIA_NIM_BASE_URL}[/dim]\n"
+        f"• Preset Model: [green]{NVIDIA_NIM_DEFAULT_MODEL}[/green]",
+        title="[bold green]Quick Setup[/bold green]",
+        border_style="bright_cyan",
+        box=ROUNDED,
+        padding=(1, 2),
+    ))
+
+    choice: Optional[str] = None
+    if sys.stdin.isatty():
+        try:
+            choice = await _prompt_arrow_menu(
+                title="Choose how to configure ireri:",
+                options=[
+                    {
+                        "key": "nvidia",
+                        "label": f"★ NVIDIA NIM Preset (Free Tier — only enter API key)",
+                        "pt_style": "class:allow",
+                    },
+                    {
+                        "key": "custom",
+                        "label": "⚙ Custom Provider (Base URL, API Key & Default Model)",
+                        "pt_style": "class:accent",
+                    },
+                    {
+                        "key": "skip",
+                        "label": "→ Skip for now (initialize without API key)",
+                        "pt_style": "class:item",
+                    },
+                ],
+                hotkeys={"1": "nvidia", "2": "custom", "3": "skip"},
+            )
+        except Exception:
+            choice = None
+
+    if choice is None:
+        return
+
+    loop = asyncio.get_event_loop()
+    if choice == "nvidia":
+        console.print(f"\n[dim]Get a free NVIDIA API key at: https://build.nvidia.com/[/dim]")
+        entered_key = (await loop.run_in_executor(
+            None,
+            lambda: Prompt.ask("[bold cyan]Enter NVIDIA API Key (nvapi-... or Enter to skip)[/bold cyan]", default=""),
+        )).strip()
+        if entered_key:
+            sync_api_credentials(
+                api_key=entered_key,
+                base_url=NVIDIA_NIM_BASE_URL,
+                model=NVIDIA_NIM_DEFAULT_MODEL,
+                profile_name="nvidia",
+            )
+            console.print(render_system_message(
+                f"[green]✓ NVIDIA NIM configured and synced![/green]\n"
+                f"Model: [cyan]{NVIDIA_NIM_DEFAULT_MODEL}[/cyan]  •  Change anytime with [bold]/model[/bold]"
+            ))
+        else:
+            # Still pre-set NVIDIA base URL & default model so user only needs to add key later
+            sync_api_credentials(
+                api_key="",
+                base_url=NVIDIA_NIM_BASE_URL,
+                model=NVIDIA_NIM_DEFAULT_MODEL,
+                profile_name="nvidia",
+            )
+            console.print(render_system_message(
+                "[yellow]Skipped API key. NVIDIA NIM preset URL & model saved — run /provider nvidia anytime.[/yellow]"
+            ))
+    elif choice == "custom":
+        entered_url = (await loop.run_in_executor(
+            None,
+            lambda: Prompt.ask("[bold cyan]Base URL[/bold cyan]", default=config.openai_base_url or "https://api.openai.com/v1"),
+        )).strip()
+        entered_key = (await loop.run_in_executor(
+            None,
+            lambda: Prompt.ask("[bold cyan]API Key (Enter to skip)[/bold cyan]", default=""),
+        )).strip()
+        entered_model = (await loop.run_in_executor(
+            None,
+            lambda: Prompt.ask("[bold cyan]Default Model[/bold cyan]", default=config.openai_model or "gpt-4o-mini"),
+        )).strip()
+        sync_api_credentials(
+            api_key=entered_key,
+            base_url=entered_url,
+            model=entered_model,
+        )
+        if entered_key:
+            console.print(render_system_message(
+                f"[green]✓ Provider configured and synced![/green] Model: [cyan]{entered_model}[/cyan]"
+            ))
+        else:
+            console.print(render_system_message(
+                "[yellow]Saved Base URL & Model without API key — run /provider anytime to add your key.[/yellow]"
+            ))
+    else:
+        console.print(render_system_message(
+            "[dim]Starting without API key. Run [bold]/provider[/bold] or [bold]/settings[/bold] when ready.[/dim]"
+        ))
+
+
 async def _chat_async(
     project: Optional[Path],
     model: Optional[str],
@@ -436,6 +574,7 @@ async def _chat_async(
     new_session: bool = False,
 ):
     """Async implementation of chat."""
+    from agent.config import sync_api_credentials
     reset_config()
     config = get_config()
 
@@ -451,13 +590,23 @@ async def _chat_async(
         config.openai_base_url = base_url
     if api_key:
         config.openai_api_key = api_key
+        sync_api_credentials(api_key=api_key, base_url=config.openai_base_url, model=config.openai_model)
     if max_iterations is not None:
         config.max_iterations = max_iterations
 
-    # Validate
-    if not config.openai_api_key:
-        console.print("[red]Error: API key required. Set OPENAI_API_KEY in .env or use --api-key[/red]")
-        raise typer.Exit(1)
+    # First-run onboarding if no API key is configured (agent still initializes without it!)
+    if not config.openai_api_key and sys.stdin.isatty():
+        await _run_first_time_setup(config)
+        reset_config()
+        config = get_config()
+        if project:
+            config.workspace_root = project.resolve()
+        if model:
+            config.openai_model = model
+        if base_url:
+            config.openai_base_url = base_url
+        if max_iterations is not None:
+            config.max_iterations = max_iterations
 
     # Welcome banner - IRERI CODE in large font
     console.print()
@@ -472,11 +621,13 @@ async def _chat_async(
     for line in banner_lines:
         console.print(f"[bold bright_cyan]{line}[/bold bright_cyan]")
     console.print()
-    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.0.0[/bold bright_green]")
+    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.1.0[/bold bright_green]")
     console.print()
+    key_status = "[green]Configured[/green]" if config.openai_api_key else "[yellow]Not set (/provider)[/yellow]"
     console.print(render_system_message(
         f"Model: [green]{config.openai_model}[/green]  •  "
-        f"Workspace: [green]{config.workspace_root}[/green]  •  Max iterations: [green]{config.max_iterations}[/green]"
+        f"API Key: {key_status}  •  "
+        f"Workspace: [green]{config.workspace_root}[/green]"
     ))
     console.print(render_system_message("[dim]Type 'exit' or 'quit' to leave. Type '/help' for commands.[/dim]"))
     console.print()
@@ -501,26 +652,52 @@ async def _chat_async(
 
     thinking = ThinkingIndicator(console)
 
-    # Initialize prompt_toolkit session with auto-completion and dynamic prompt
+    # Initialize prompt_toolkit session with auto-completion, Enter auto-select, and dynamic prompt
     from prompt_toolkit import PromptSession
+    from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.shortcuts import CompleteStyle
     pt_completer = SlashCommandCompleter()
+    pt_kb = KeyBindings()
+
+    @pt_kb.add("enter")
+    def _pt_enter(event):
+        buf = event.current_buffer
+        text = buf.text.strip()
+        if buf.complete_state:
+            if buf.complete_state.current_completion is not None:
+                buf.apply_completion(buf.complete_state.current_completion)
+            elif (
+                buf.complete_state.completions
+                and text.startswith("/")
+                and " " not in text
+                and text.lower() not in SLASH_COMMANDS
+                and text.lower() not in ("/q", "/quit", "/log", "/processes", "/cancel")
+            ):
+                buf.apply_completion(buf.complete_state.completions[0])
+        elif text.startswith("/") and " " not in text:
+            matched = _resolve_first_slash_command(text)
+            if matched:
+                buf.text = matched
+                buf.cursor_position = len(matched)
+        buf.validate_and_handle()
+
     pt_session = PromptSession(
         erase_when_done=True,
         completer=pt_completer,
         complete_while_typing=True,
         complete_style=CompleteStyle.COLUMN,
         style=SLASH_COMPLETION_STYLE,
+        key_bindings=pt_kb,
     )
     approval_handoff_event = asyncio.Event()
 
     # Define approval callback for interactive mode
-    async def _approval_callback(tool_name: str, args: Dict[str, Any], dangerous: bool) -> bool:
+    async def _approval_callback(tool_name: str, args: Dict[str, Any], dangerous: bool) -> tuple[bool, Optional[str]]:
         """Prompt user for tool approval with interactive arrow selection and /btw support."""
         if controller._approve_all:
-            return True
+            return True, None
         if controller._deny_all:
-            return False
+            return False, None
 
         thinking.stop()
         from rich.markup import escape
@@ -929,6 +1106,19 @@ SLASH_COMPLETION_STYLE = Style.from_dict({
 })
 
 
+def _resolve_first_slash_command(prefix: str) -> Optional[str]:
+    """Return the first matching slash command for a partial prefix, or None if exact/alias."""
+    low = prefix.strip().lower()
+    if not low.startswith("/"):
+        return None
+    if low in SLASH_COMMANDS or low in ("/q", "/quit", "/log", "/processes", "/cancel"):
+        return None
+    for cmd in SLASH_COMMANDS:
+        if cmd.startswith(low):
+            return cmd
+    return None
+
+
 class SlashCommandCompleter(Completer):
     """Auto-completion for slash commands with icons and stylish formatting."""
 
@@ -1022,6 +1212,9 @@ async def _handle_slash_command(command: str, controller: AgentController) -> No
 
     parts = command.split()
     cmd = parts[0].lower()
+    resolved = _resolve_first_slash_command(cmd)
+    if resolved:
+        cmd = resolved
 
     if cmd == "/btw":
         question = command[4:].strip() if len(command) > 4 else ""
@@ -1901,11 +2094,11 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
             f"[bold bright_green]Max Iterations:[/bold bright_green] [green]{config.max_iterations}[/green]  •  "
             f"[bold bright_green]Max Tool Calls:[/bold bright_green] [green]{config.max_tool_calls}[/green]\n"
             f"[bold bright_green]Tool Access:[/bold bright_green] [yellow]{tool_access_summary}[/yellow]\n\n"
-            "[bold bright_yellow]★ RECOMMENDED: NVIDIA NIM Free Models ★[/bold bright_yellow]\n"
+            f"[bold bright_yellow]★ RECOMMENDED: NVIDIA NIM Free Models ★[/bold bright_yellow]\n"
             "NVIDIA provides 1,000 free API credits with access to top-tier open models.\n"
             "• [bold]Register for free key:[/bold] [underline cyan]https://build.nvidia.com/[/underline cyan]\n"
             "• [bold]Base URL:[/bold] [cyan]https://integrate.api.nvidia.com/v1[/cyan]\n"
-            "• [bold]Top Models:[/bold] [green]nvidia/nemotron-3.5-bolt-e4b[/green], [green]meta/llama-3.3-70b-instruct[/green], [green]deepseek-ai/deepseek-r1[/green]\n\n"
+            "• [bold]Preset Model:[/bold] [green]nvidia/nemotron-3.5-super-vl-120b-a12b[/green] (change anytime with /model)\n\n"
             "[bold]Quick Commands:[/bold]\n"
             "• [cyan]/provider nvidia[/cyan]      -> Fast 1-step setup for NVIDIA NIM\n"
             "• [cyan]/provider add[/cyan]         -> Guided wizard to add any provider (NVIDIA, OpenAI, Groq...)\n"
@@ -1947,10 +2140,13 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
         return
 
     elif subcommand == "nvidia":
+        from agent.config import NVIDIA_NIM_BASE_URL, NVIDIA_NIM_DEFAULT_MODEL, sync_api_credentials
         console.print()
         console.print(Panel(
-            "[bold bright_cyan]NVIDIA NIM Provider Setup[/bold bright_cyan]\n"
+            "[bold bright_cyan]NVIDIA NIM Provider Setup (Preset)[/bold bright_cyan]\n"
             "NVIDIA provides 1,000 free API credits on registration!\n"
+            f"• Base URL: [cyan]{NVIDIA_NIM_BASE_URL}[/cyan]\n"
+            f"• Default Model: [green]{NVIDIA_NIM_DEFAULT_MODEL}[/green]\n"
             "Register & get your free key at: [bold underline cyan]https://build.nvidia.com/[/bold underline cyan]",
             title="[bold green]NVIDIA Free Tier[/bold green]",
             border_style="green",
@@ -1962,15 +2158,18 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
             console.print("[yellow]Setup cancelled: API key required.[/yellow]")
             return
 
-        base_url = "https://integrate.api.nvidia.com/v1"
-        console.print("\n[dim]Recommended models: nvidia/nemotron-3.5-bolt-e4b, meta/llama-3.3-70b-instruct, deepseek-ai/deepseek-r1[/dim]")
-        model = Prompt.ask("[bold cyan]Default Model[/bold cyan]", default="nvidia/nemotron-3.5-bolt-e4b").strip()
-
-        save_profile("nvidia", api_key, base_url, model)
-        load_profile("nvidia")
+        sync_api_credentials(
+            api_key=api_key,
+            base_url=NVIDIA_NIM_BASE_URL,
+            model=NVIDIA_NIM_DEFAULT_MODEL,
+            profile_name="nvidia",
+        )
         reset_model_client()
         controller.model_client = get_model_client()
-        console.print(render_system_message(f"[green]NVIDIA provider configured and activated with model '{model}'![/green]"))
+        console.print(render_system_message(
+            f"[green]NVIDIA NIM configured & synced with model '{NVIDIA_NIM_DEFAULT_MODEL}'![/green]\n"
+            f"[dim]You can change the default model later anytime with /model[/dim]"
+        ))
         return
 
     elif subcommand == "add":
@@ -1987,9 +2186,10 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
             choice = Prompt.ask("[bold cyan]Choice[/bold cyan]", choices=["1", "2", "3", "4", "5"], default="1")
 
             if choice == "1":
+                from agent.config import NVIDIA_NIM_BASE_URL, NVIDIA_NIM_DEFAULT_MODEL
                 name = "nvidia"
-                default_url = "https://integrate.api.nvidia.com/v1"
-                default_model = "nvidia/nemotron-3.5-bolt-e4b"
+                default_url = NVIDIA_NIM_BASE_URL
+                default_model = NVIDIA_NIM_DEFAULT_MODEL
                 console.print("[dim]Register for free key: https://build.nvidia.com/[/dim]")
             elif choice == "2":
                 name = "openai"
@@ -2009,8 +2209,9 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
                 default_model = "gpt-4o-mini"
         else:
             if name.lower() == "nvidia":
-                default_url = "https://integrate.api.nvidia.com/v1"
-                default_model = "nvidia/nemotron-3.5-bolt-e4b"
+                from agent.config import NVIDIA_NIM_BASE_URL, NVIDIA_NIM_DEFAULT_MODEL
+                default_url = NVIDIA_NIM_BASE_URL
+                default_model = NVIDIA_NIM_DEFAULT_MODEL
                 console.print("[dim]Register for free key: https://build.nvidia.com/[/dim]")
             else:
                 default_url = "https://api.openai.com/v1"
@@ -2105,6 +2306,44 @@ async def _fetch_models(base_url: str, api_key: str) -> list:
             return data.get("data", [])
     except Exception:
         return []
+
+
+@app.callback(invoke_without_command=True)
+def default_command(
+    ctx: typer.Context,
+    project: Optional[Path] = typer.Option(
+        None, "--project", "-p", help="Project directory"
+    ),
+    model: Optional[str] = typer.Option(
+        None, "--model", "-m", help="Model to use"
+    ),
+    base_url: Optional[str] = typer.Option(
+        None, "--base-url", "-u", help="API base URL"
+    ),
+    api_key: Optional[str] = typer.Option(
+        None, "--api-key", "-k", help="API key"
+    ),
+    max_iterations: Optional[int] = typer.Option(
+        None, "--max-iterations", "-i", help="Maximum iterations (default: 1000)"
+    ),
+    auto_approve: bool = typer.Option(
+        False, "--yes", "-y", "--auto-approve", help="Auto-approve all tool calls"
+    ),
+    new_session: bool = typer.Option(
+        False, "--new", help="Start a new session without resuming previous history"
+    ),
+):
+    """Start IRERI CODE interactive chat by default."""
+    if ctx.invoked_subcommand is None:
+        chat(
+            project=project,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            max_iterations=max_iterations,
+            auto_approve=auto_approve,
+            new_session=new_session,
+        )
 
 
 @app.command()
@@ -2334,8 +2573,8 @@ def init(
 
     console.print()
     console.print(render_system_message("[bold]Next steps:[/bold]"))
-    console.print(render_system_message("1. Edit .env with your API key"))
-    console.print(render_system_message("2. Run 'ireri chat' to start"))
+    console.print(render_system_message("1. Run 'ireri' to start (interactive setup will guide you if needed)"))
+    console.print(render_system_message("2. Or edit .env with your API key first"))
     console.print()
 
 
@@ -2464,7 +2703,7 @@ def _show_provider_command() -> None:
         "NVIDIA provides 1,000 free API credits with access to top-tier open models.\n"
         "• [bold]Register for free key:[/bold] [underline cyan]https://build.nvidia.com/[/underline cyan]\n"
         "• [bold]Base URL:[/bold] [cyan]https://integrate.api.nvidia.com/v1[/cyan]\n"
-        "• [bold]Top Models:[/bold] [green]nvidia/nemotron-3.5-bolt-e4b[/green], [green]meta/llama-3.3-70b-instruct[/green], [green]deepseek-ai/deepseek-r1[/green]\n\n"
+        "• [bold]Preset Model:[/bold] [green]nvidia/nemotron-3.5-super-vl-120b-a12b[/green] (change anytime with /model)\n\n"
         "[bold]Quick Commands:[/bold]\n"
         "• [cyan]/provider nvidia[/cyan]      -> Fast 1-step setup for NVIDIA NIM\n"
         "• [cyan]/provider add[/cyan]         -> Guided wizard to add any provider\n"
@@ -2531,7 +2770,7 @@ def _show_config_command() -> None:
 def _show_version_command() -> None:
     """Handle /version command."""
     console.print(Panel(
-        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.0.0[/bright_green]\n"
+        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.1.0[/bright_green]\n"
         "Terminal AI Coding Agent\n"
         "https://github.com/ekusafamily/ireri-code",
         title="[bold]Version Info[/bold]",

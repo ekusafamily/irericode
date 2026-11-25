@@ -14,6 +14,10 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 MODELS_CACHE_FILE = CONFIG_DIR / "models.json"
 PROFILES_FILE = CONFIG_DIR / "profiles.json"
 
+# Provider Presets
+NVIDIA_NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
+NVIDIA_NIM_DEFAULT_MODEL = "nvidia/nemotron-3.5-super-vl-120b-a12b"
+
 
 class AgentConfig(BaseSettings):
     """Agent configuration loaded from global config file."""
@@ -195,7 +199,7 @@ def get_profile(name: str) -> Optional[dict]:
 
 
 def load_profile(name: str) -> bool:
-    """Load a profile as the active config."""
+    """Load a profile as the active config and synchronize environment variables."""
     profile = get_profile(name)
     if not profile:
         return False
@@ -205,7 +209,56 @@ def load_profile(name: str) -> bool:
     )
     if profile.get("model"):
         update_config(openai_model=profile["model"])
+    os.environ["OPENAI_API_KEY"] = profile.get("api_key", "")
+    os.environ["OPENAI_BASE_URL"] = profile.get("base_url", "")
+    if profile.get("model"):
+        os.environ["OPENAI_MODEL"] = profile["model"]
     return True
+
+
+def sync_api_credentials(
+    api_key: str,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
+    profile_name: Optional[str] = None,
+) -> AgentConfig:
+    """Synchronize API credentials across global config, profiles, and environment variables."""
+    config = get_config()
+    eff_base_url = (base_url or config.openai_base_url).strip()
+    eff_model = (model or config.openai_model).strip()
+    eff_key = api_key.strip()
+
+    updated = update_config(
+        openai_api_key=eff_key,
+        openai_base_url=eff_base_url,
+        openai_model=eff_model,
+    )
+
+    # Sync to current process environment
+    if eff_key:
+        os.environ["OPENAI_API_KEY"] = eff_key
+    if eff_base_url:
+        os.environ["OPENAI_BASE_URL"] = eff_base_url
+    if eff_model:
+        os.environ["OPENAI_MODEL"] = eff_model
+
+    # Sync to saved profile
+    if profile_name is None:
+        if "nvidia.com" in eff_base_url.lower():
+            profile_name = "nvidia"
+        elif "openai.com" in eff_base_url.lower():
+            profile_name = "openai"
+        elif "openrouter.ai" in eff_base_url.lower():
+            profile_name = "openrouter"
+        elif "groq.com" in eff_base_url.lower():
+            profile_name = "groq"
+        else:
+            profile_name = "default"
+
+    if eff_key:
+        save_profile(profile_name, eff_key, eff_base_url, eff_model)
+
+    return updated
 
 
 def _load_dotenv_file() -> dict:
@@ -231,15 +284,17 @@ def get_config() -> AgentConfig:
     """Get the global configuration instance."""
     global _config
     if _config is None:
-        # Priority: global config file > .env file > defaults
+        # Priority: global config file > .env file > environment > defaults
+        # Empty strings in global config do not shadow .env or env vars.
         global_values = _load_global_config()
         dotenv_values = _load_dotenv_file()
 
-        # Merge: global config takes priority, then .env, then defaults
         merged = {}
-        merged.update(global_values)  # Global config (highest priority)
+        for k, v in global_values.items():
+            if v != "" and v is not None:
+                merged[k] = v
         for k, v in dotenv_values.items():
-            if k not in merged:  # Only use .env if not in global config
+            if k not in merged and v != "":
                 merged[k] = v
 
         _config = AgentConfig(**merged)
