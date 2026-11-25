@@ -498,9 +498,11 @@ class GetProcessLogsTool(Tool):
         pm = get_process_manager()
         proc, logs = pm.get_logs(process_id=args.process_id, tail=args.tail)
         if not proc:
+            available = [p.process_id for p in pm.list_processes()]
+            hint = f"Available processes: {', '.join(available)}" if available else "No processes have been started yet."
             return ToolResult(
                 success=False,
-                error=f"Process not found: {args.process_id or 'no processes started yet'}",
+                error=f"Process not found: {args.process_id or 'none'}. {hint}",
             )
         return ToolResult(
             success=True,

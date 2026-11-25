@@ -21,8 +21,8 @@ from agent.model import ModelClient, ModelResponse
 from agent.tools import Tool, ToolArgument, ToolRegistry, ToolResult
 
 
-def test_version_is_2_1_1():
-    assert __version__ == "2.1.1"
+def test_version_is_2_1_2():
+    assert __version__ == "2.1.2"
 
 
 def test_nvidia_nim_preset_constants():
@@ -144,4 +144,32 @@ def test_cli_default_command_is_chat():
     assert "--project" in res.output
     assert "--model" in res.output
     assert "chat" in res.output
+
+
+def test_progress_callback_handles_none_output_and_metadata():
+    """Failed tool_complete events with output=None or metadata=None must not raise AttributeError."""
+    from agent.cli import _progress_callback
+
+    for tool_name in ("read_file", "edit_file", "write_file", "list_files", "delete_file"):
+        _progress_callback(
+            "tool_complete",
+            {
+                "tool": tool_name,
+                "success": False,
+                "output": None,
+                "metadata": None,
+                "error": "Path escapes workspace",
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_process_logs_missing_id_includes_hint():
+    from agent.tools.terminal import GetProcessLogsArgs, GetProcessLogsTool
+
+    tool = GetProcessLogsTool()
+    res = await tool.execute(GetProcessLogsArgs(process_id="proc-999"))
+    assert res.success is False
+    assert "Process not found: proc-999" in res.error
+
 

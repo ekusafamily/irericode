@@ -128,19 +128,26 @@ def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["Thi
             thinking.stop()
         tool = data["tool"]
         success = data.get("success", False)
-        metadata = data.get("metadata", {})
-        if tool == "write_file":
+        metadata = data.get("metadata") or {}
+        output = data.get("output") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if not isinstance(output, dict):
+            output = {}
+
+        if not success and tool != "run_command":
+            console.print(f"  [red]FAIL[/red] {tool} failed: {data.get('error', 'unknown')}\n")
+        elif tool == "write_file":
             action = metadata.get("action", "written")
             console.print(f"  [green]OK[/green] File {action}\n")
         elif tool == "edit_file":
-            replacements = data.get("output", {}).get("replacements", 0)
+            replacements = output.get("replacements", 0)
             console.print(f"  [yellow]OK[/yellow] File edited ({replacements} replacement(s))\n")
         elif tool == "read_file":
-            output = data.get("output", {})
             lines = output.get("total_lines", 0)
             console.print(f"  [blue]OK[/blue] Read {lines} lines\n")
         elif tool == "list_files":
-            count = data.get("metadata", {}).get("count", 0)
+            count = metadata.get("count", 0)
             console.print(f"  [blue]OK[/blue] Found {count} items\n")
         elif tool == "run_command":
             if success:
@@ -163,10 +170,7 @@ def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["Thi
         elif tool == "search_files" or tool == "grep":
             console.print(f"  [blue]OK[/blue] Search completed\n")
         else:
-            if success:
-                console.print(f"  [dim]OK[/dim] {tool} completed\n")
-            else:
-                console.print(f"  [red]FAIL[/red] {tool} failed: {data.get('error', 'unknown')}\n")
+            console.print(f"  [dim]OK[/dim] {tool} completed\n")
     elif event == "tool_error":
         if thinking:
             thinking.stop()
@@ -642,7 +646,7 @@ async def _chat_async(
     for line in banner_lines:
         console.print(f"[bold bright_cyan]{line}[/bold bright_cyan]")
     console.print()
-    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.1.1[/bold bright_green]")
+    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.1.2[/bold bright_green]")
     console.print()
     key_status = "[green]Configured[/green]" if config.openai_api_key else "[yellow]Not set (/provider)[/yellow]"
     console.print(render_system_message(
@@ -3059,7 +3063,7 @@ def _show_config_command() -> None:
 def _show_version_command() -> None:
     """Handle /version command."""
     console.print(Panel(
-        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.1.1[/bright_green]\n"
+        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.1.2[/bright_green]\n"
         "Terminal AI Coding Agent\n"
         "https://github.com/ekusafamily/ireri-code",
         title="[bold]Version Info[/bold]",
