@@ -19,6 +19,7 @@ from agent.config import (
     GOOGLE_PEAK_TPM,
     GOOGLE_PEAK_RPD,
     GOOGLE_USAGE_FILE,
+    NVIDIA_PEAK_RPM,
 )
 
 logger = logging.getLogger(__name__)
@@ -103,11 +104,19 @@ class ModelRateLimiter:
         return low.startswith("gemini-") or low.startswith("gemma-") or low.startswith("models/gemini-") or low.startswith("models/gemma-")
 
     @staticmethod
-    def get_rpm_limit(model_name: str) -> Optional[int]:
-        """Return configured calls-per-minute limit for a model, or None if unlimited."""
-        if not model_name:
+    def is_nvidia_request(model_name: str, base_url: str = "") -> bool:
+        """Detect whether a request targets NVIDIA NIM."""
+        if base_url and "nvidia.com" in base_url.lower():
+            return True
+        low = (model_name or "").strip().lower()
+        return low.startswith("nvidia/")
+
+    @staticmethod
+    def get_rpm_limit(model_name: str, base_url: str = "") -> Optional[int]:
+        """Return configured calls-per-minute limit for a model/provider, or None if unlimited."""
+        if not model_name and not base_url:
             return None
-        normalized = model_name.strip().lower()
+        normalized = (model_name or "").strip().lower()
         if normalized.startswith("models/"):
             normalized = normalized[len("models/"):]
         if normalized in MODEL_RATE_LIMITS_RPM:
@@ -115,6 +124,8 @@ class ModelRateLimiter:
         for key, limit in MODEL_RATE_LIMITS_RPM.items():
             if normalized.startswith(key):
                 return limit
+        if ModelRateLimiter.is_nvidia_request(model_name, base_url):
+            return NVIDIA_PEAK_RPM
         return None
 
     async def acquire(
@@ -129,16 +140,20 @@ class ModelRateLimiter:
         Returns the total seconds waited.
         """
         is_google = self.is_google_request(model_name, base_url)
-        rpm_limit = self.get_rpm_limit(model_name)
+        is_nvidia = self.is_nvidia_request(model_name, base_url)
+        rpm_limit = self.get_rpm_limit(model_name, base_url)
         tpm_limit = GOOGLE_PEAK_TPM if is_google else None
         rpd_limit = GOOGLE_PEAK_RPD if is_google else None
 
         if rpm_limit is None and not is_google:
             return 0.0
 
-        key = (model_name or "").strip().lower()
-        if key.startswith("models/"):
-            key = key[len("models/"):]
+        if is_nvidia and rpm_limit == NVIDIA_PEAK_RPM:
+            key = "provider:nvidia"
+        else:
+            key = (model_name or "").strip().lower()
+            if key.startswith("models/"):
+                key = key[len("models/"):]
 
         total_waited = 0.0
         while True:

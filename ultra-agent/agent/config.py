@@ -33,6 +33,9 @@ GOOGLE_PEAK_TPM = 220_000
 GOOGLE_PEAK_RPD = 490
 GOOGLE_USAGE_FILE = CONFIG_DIR / "google_usage.json"
 
+# NVIDIA NIM rate limit (40 requests per minute)
+NVIDIA_PEAK_RPM = 40
+
 
 class AgentConfig(BaseSettings):
     """Agent configuration loaded from global config file."""

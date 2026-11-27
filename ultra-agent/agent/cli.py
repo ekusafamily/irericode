@@ -794,7 +794,7 @@ async def _chat_async(
     for line in banner_lines:
         console.print(f"[bold bright_cyan]{line}[/bold bright_cyan]")
     console.print()
-    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.1.7[/bold bright_green]")
+    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.1.8[/bold bright_green]")
     console.print()
     key_status = "[green]Configured[/green]" if config.openai_api_key else "[yellow]Not set (/provider)[/yellow]"
     console.print(render_system_message(
@@ -1028,6 +1028,13 @@ async def _chat_async(
             else:
                 current_task = None
 
+        # Ensure prompt_toolkit redraws a clean input prompt after background task finishes
+        try:
+            if pt_session.app.is_running:
+                pt_session.app.invalidate()
+        except Exception:
+            pass
+
     # Chat loop
     async def _chat_loop():
         nonlocal background_worker_task
@@ -1042,15 +1049,17 @@ async def _chat_async(
                     continue
 
                 console.print()
-                # Get user input with prompt_toolkit, falling back to readline/input
+                # Get user input with prompt_toolkit (patch_stdout keeps prompt clean during background output)
                 try:
-                    user_input = await pt_session.prompt_async(
-                        _get_dynamic_prompt,
-                        completer=pt_completer,
-                        complete_while_typing=True,
-                        complete_style=CompleteStyle.COLUMN,
-                        style=SLASH_COMPLETION_STYLE,
-                    )
+                    from prompt_toolkit.patch_stdout import patch_stdout
+                    with patch_stdout(raw=True):
+                        user_input = await pt_session.prompt_async(
+                            _get_dynamic_prompt,
+                            completer=pt_completer,
+                            complete_while_typing=True,
+                            complete_style=CompleteStyle.COLUMN,
+                            style=SLASH_COMPLETION_STYLE,
+                        )
                 except (EOFError, KeyboardInterrupt):
                     raise
                 except Exception:
@@ -3409,7 +3418,7 @@ def _show_config_command() -> None:
 def _show_version_command() -> None:
     """Handle /version command."""
     console.print(Panel(
-        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.1.7[/bright_green]\n"
+        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.1.8[/bright_green]\n"
         "Terminal AI Coding Agent\n"
         "https://github.com/ekusafamily/ireri-code",
         title="[bold]Version Info[/bold]",

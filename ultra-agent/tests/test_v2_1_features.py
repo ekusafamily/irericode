@@ -21,8 +21,8 @@ from agent.model import ModelClient, ModelResponse
 from agent.tools import Tool, ToolArgument, ToolRegistry, ToolResult
 
 
-def test_version_is_2_1_7():
-    assert __version__ == "2.1.7"
+def test_version_is_2_1_8():
+    assert __version__ == "2.1.8"
 
 
 def test_nvidia_nim_preset_constants():
@@ -467,6 +467,26 @@ async def test_read_file_dedup_default_cap_and_compact(monkeypatch, tmp_path):
     before, after = ctx.compact_history(keep_recent_messages=2)
     assert after < before
     assert ctx.messages[0].role == "system"
+
+
+@pytest.mark.asyncio
+async def test_nvidia_40_rpm_rate_limit(monkeypatch):
+    from agent.config import NVIDIA_NIM_BASE_URL, NVIDIA_PEAK_RPM
+    from agent.model import ModelRateLimiter
+
+    assert NVIDIA_PEAK_RPM == 40
+    limiter = ModelRateLimiter(window_seconds=0.15)
+    assert limiter.get_rpm_limit("nvidia/nemotron-3.5-super-vl-120b-a12b", NVIDIA_NIM_BASE_URL) == 40
+    assert limiter.get_rpm_limit("meta/llama-3.3-70b-instruct", NVIDIA_NIM_BASE_URL) == 40
+
+    monkeypatch.setattr("agent.model.NVIDIA_PEAK_RPM", 2)
+    events = []
+    await limiter.acquire("meta/llama-3.3-70b-instruct", base_url=NVIDIA_NIM_BASE_URL, progress_callback=lambda e, d: events.append((e, d)))
+    await limiter.acquire("nvidia/nemotron-3.5-super-vl-120b-a12b", base_url=NVIDIA_NIM_BASE_URL, progress_callback=lambda e, d: events.append((e, d)))
+    waited = await limiter.acquire("meta/llama-3.3-70b-instruct", base_url=NVIDIA_NIM_BASE_URL, progress_callback=lambda e, d: events.append((e, d)))
+    assert waited > 0
+    assert any(e == "rate_limit_wait" and d.get("rpm_limit") == 2 for e, d in events)
+
 
 
 
