@@ -21,8 +21,8 @@ from agent.model import ModelClient, ModelResponse
 from agent.tools import Tool, ToolArgument, ToolRegistry, ToolResult
 
 
-def test_version_is_2_1_8():
-    assert __version__ == "2.1.8"
+def test_version_is_2_1_9():
+    assert __version__ == "2.1.9"
 
 
 def test_nvidia_nim_preset_constants():

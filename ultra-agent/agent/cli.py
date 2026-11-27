@@ -794,7 +794,7 @@ async def _chat_async(
     for line in banner_lines:
         console.print(f"[bold bright_cyan]{line}[/bold bright_cyan]")
     console.print()
-    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.1.8[/bold bright_green]")
+    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.1.9[/bold bright_green]")
     console.print()
     key_status = "[green]Configured[/green]" if config.openai_api_key else "[yellow]Not set (/provider)[/yellow]"
     console.print(render_system_message(
@@ -2541,15 +2541,20 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
                     if load_profile(pname):
                         reset_model_client()
                         controller.model_client = get_model_client()
-                        console.print(render_system_message(f"[green]✓ Switched active provider to '{pname}'.[/green]"))
+                        console.print(render_system_message(f"[green]✓ Switched active provider to '{pname}' (saved).[/green]"))
+                    return
                 elif action == "add_google":
                     await _handle_provider_command(["/provider", "google"], controller)
+                    return
                 elif action == "add_nvidia":
                     await _handle_provider_command(["/provider", "nvidia"], controller)
+                    return
                 elif action == "add_wizard":
                     await _handle_provider_command(["/provider", "add"], controller)
+                    return
                 elif action == "model":
                     await _show_models_command(get_config(), controller)
+                    return
                 elif action == "tools":
                     await _interactive_tool_access_edit(controller)
                 elif action == "edit":
@@ -3418,7 +3423,7 @@ def _show_config_command() -> None:
 def _show_version_command() -> None:
     """Handle /version command."""
     console.print(Panel(
-        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.1.8[/bright_green]\n"
+        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.1.9[/bright_green]\n"
         "Terminal AI Coding Agent\n"
         "https://github.com/ekusafamily/ireri-code",
         title="[bold]Version Info[/bold]",
