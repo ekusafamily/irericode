@@ -21,8 +21,8 @@ from agent.model import ModelClient, ModelResponse
 from agent.tools import Tool, ToolArgument, ToolRegistry, ToolResult
 
 
-def test_version_is_2_1_6():
-    assert __version__ == "2.1.6"
+def test_version_is_2_1_7():
+    assert __version__ == "2.1.7"
 
 
 def test_nvidia_nim_preset_constants():
@@ -418,6 +418,10 @@ async def test_google_tpm_and_rpd_limits(monkeypatch, tmp_path):
 
     # Daily RPD cap: simulate 490 requests already used today (PT)
     limiter._daily_count = 490
+    usage = limiter.get_daily_usage("gemini-3.5-flash-lite")
+    assert usage["is_google"] is True
+    assert usage["used"] == 490
+    assert usage["limit"] == 490
     with pytest.raises(DailyQuotaExceededError, match="490/490"):
         await limiter.acquire("gemini-3.5-flash-lite", est_input_tokens=100)
 

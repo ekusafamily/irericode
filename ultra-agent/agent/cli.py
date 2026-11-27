@@ -58,6 +58,7 @@ def render_task_with_side_tokens(
     tokens_down: int,
     approx_context: int,
     collapsed: bool = False,
+    rpd_info: Optional[Dict[str, Any]] = None,
 ) -> Table:
     """Render a task/response on the left and its token summary at the right side."""
     task_preview = task.strip().replace("\n", " ")
@@ -69,6 +70,8 @@ def render_task_with_side_tokens(
     grid.add_column(ratio=4)
     grid.add_column(width=24, justify="right")
 
+    rpd_inline = f" [dim]RPD {rpd_info['used']}/{rpd_info['limit']}[/dim]" if rpd_info and rpd_info.get("is_google") else ""
+
     if collapsed:
         left_panel = Panel(
             f"[bold cyan]▸ {task_preview}[/bold cyan]  [dim](collapsed — /collapse to expand)[/dim]",
@@ -77,7 +80,7 @@ def render_task_with_side_tokens(
             padding=(0, 1),
         )
         right_panel = Panel(
-            f"[cyan]↑{format_tokens(tokens_up)}[/cyan] [green]↓{format_tokens(tokens_down)}[/green] [magenta]Σ{format_tokens(total)}[/magenta]",
+            f"[cyan]↑{format_tokens(tokens_up)}[/cyan] [green]↓{format_tokens(tokens_down)}[/green] [magenta]Σ{format_tokens(total)}[/magenta]{rpd_inline}",
             border_style="dim",
             box=ROUNDED,
             padding=(0, 1),
@@ -90,11 +93,12 @@ def render_task_with_side_tokens(
             box=ROUNDED,
             padding=(0, 1),
         )
+        rpd_line = f"\n[dim]RPD {rpd_info['used']}/{rpd_info['limit']}[/dim]" if rpd_info and rpd_info.get("is_google") else ""
         right_panel = Panel(
             f"[cyan]↑ {format_tokens(tokens_up)}[/cyan] sent\n"
             f"[green]↓ {format_tokens(tokens_down)}[/green] recv\n"
             f"[magenta]Σ {format_tokens(total)}[/magenta] total\n"
-            f"[yellow]~{format_tokens(approx_context)}[/yellow] ctx",
+            f"[yellow]~{format_tokens(approx_context)}[/yellow] ctx{rpd_line}",
             title="[bold dim]Tokens[/bold dim]",
             border_style="cyan",
             box=ROUNDED,
@@ -790,7 +794,7 @@ async def _chat_async(
     for line in banner_lines:
         console.print(f"[bold bright_cyan]{line}[/bold bright_cyan]")
     console.print()
-    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.1.6[/bold bright_green]")
+    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.1.7[/bold bright_green]")
     console.print()
     key_status = "[green]Configured[/green]" if config.openai_api_key else "[yellow]Not set (/provider)[/yellow]"
     console.print(render_system_message(
@@ -853,14 +857,22 @@ async def _chat_async(
         buf.validate_and_handle()
 
     def _get_token_toolbar():
+        from agent.model import get_rate_limiter
         stats = controller.context.get_token_stats()
         collapse_label = "Collapsed" if tasks_collapsed else "Expanded"
+        rpd = get_rate_limiter().get_daily_usage(controller.model_client.model, controller.model_client.base_url)
+        rpd_part = (
+            f"  |  <ansiyellow>RPD: {rpd['used']}/{rpd['limit']}</ansiyellow>"
+            if rpd.get("is_google")
+            else ""
+        )
         return HTML(
             f" <b>Tokens:</b> "
             f"<ansicyan>↑ {format_tokens(stats['tokens_up'])} sent</ansicyan>  |  "
             f"<ansigreen>↓ {format_tokens(stats['tokens_down'])} recv</ansigreen>  |  "
             f"<ansimagenta>Σ {format_tokens(stats['total_tokens'])}</ansimagenta>  |  "
-            f"<ansiyellow>~{format_tokens(stats['approx_context_tokens'])} ctx</ansiyellow>  |  "
+            f"<ansiyellow>~{format_tokens(stats['approx_context_tokens'])} ctx</ansiyellow>"
+            f"{rpd_part}  |  "
             f"<ansibrightblack>Tasks: {collapse_label} (/collapse)</ansibrightblack> "
         )
 
@@ -988,6 +1000,9 @@ async def _chat_async(
                 "collapsed": tasks_collapsed,
             })
 
+            from agent.model import get_rate_limiter
+            rpd_info = get_rate_limiter().get_daily_usage(controller.model_client.model, controller.model_client.base_url)
+
             # Display task/result on the left with tokens at the side
             console.print()
             console.print(render_task_with_side_tokens(
@@ -997,6 +1012,7 @@ async def _chat_async(
                 tokens_down=task_down,
                 approx_context=stats["approx_context_tokens"],
                 collapsed=tasks_collapsed,
+                rpd_info=rpd_info,
             ))
 
             # Process next queued message if available
@@ -3328,7 +3344,9 @@ def _show_provider_command() -> None:
 
 def _show_tokens_command(controller: AgentController) -> None:
     """Handle /tokens command - display session token analytics and approximate context length."""
+    from agent.model import get_rate_limiter
     stats = controller.context.get_token_stats()
+    rpd = get_rate_limiter().get_daily_usage(controller.model_client.model, controller.model_client.base_url)
     table = Table(title="Session Token Analytics & Context", box=ROUNDED, border_style="bright_blue")
     table.add_column("Metric", style="cyan", width=26)
     table.add_column("Value", style="bold white")
@@ -3337,6 +3355,8 @@ def _show_tokens_command(controller: AgentController) -> None:
     table.add_row("Tokens Received (↓ Down)", format_tokens(stats['tokens_down']), "Output completion tokens generated by model")
     table.add_row("Total Session Tokens", format_tokens(stats['total_tokens']), "Total tokens consumed during this session")
     table.add_row("Approx. Active Context", f"~{format_tokens(stats['approx_context_tokens'])}", f"Estimated active context memory ({len(controller.context.messages)} conversation items)")
+    if rpd.get("is_google"):
+        table.add_row("Google Daily Requests (RPD)", f"{rpd['used']} / {rpd['limit']}", f"Requests today ({rpd['date_pt']} PT, resets 12:00 AM PT)")
     console.print()
     console.print(table)
     console.print()
@@ -3344,8 +3364,10 @@ def _show_tokens_command(controller: AgentController) -> None:
 
 def _show_status_command(controller: AgentController) -> None:
     """Handle /status command - show agent status."""
+    from agent.model import get_rate_limiter
     config = get_config()
     stats = controller.context.get_token_stats()
+    rpd = get_rate_limiter().get_daily_usage(controller.model_client.model, controller.model_client.base_url)
     table = Table(title="ireri Status", box=ROUNDED, border_style="bright_blue")
     table.add_column("Property", style="cyan")
     table.add_column("Value", style="white")
@@ -3360,6 +3382,8 @@ def _show_status_command(controller: AgentController) -> None:
     table.add_row("Tokens Received (↓)", format_tokens(stats['tokens_down']))
     table.add_row("Total Session Tokens", format_tokens(stats['total_tokens']))
     table.add_row("Approx. Context Length", f"~{format_tokens(stats['approx_context_tokens'])}")
+    if rpd.get("is_google"):
+        table.add_row("Google RPD Today", f"{rpd['used']} / {rpd['limit']} (PT)")
     table.add_row("Session", "Active")
 
     console.print()
@@ -3375,7 +3399,7 @@ def _show_config_command() -> None:
 def _show_version_command() -> None:
     """Handle /version command."""
     console.print(Panel(
-        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.1.6[/bright_green]\n"
+        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.1.7[/bright_green]\n"
         "Terminal AI Coding Agent\n"
         "https://github.com/ekusafamily/ireri-code",
         title="[bold]Version Info[/bold]",

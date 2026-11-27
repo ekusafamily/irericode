@@ -75,7 +75,13 @@ Do you approve? (yes/no)"""
 
 def get_system_prompt() -> str:
     """Get the system prompt."""
-    return SYSTEM_PROMPT
+    import platform
+    os_name = platform.system() or "Unknown"
+    os_hint = (
+        f"\n\nHost OS: {os_name} ({platform.platform()}). "
+        + ("Use Windows-compatible commands (do not run Linux-only commands like 'uname')." if os_name == "Windows" else "")
+    )
+    return SYSTEM_PROMPT + os_hint
 
 
 def get_task_prompt(task: str, context: str) -> str:

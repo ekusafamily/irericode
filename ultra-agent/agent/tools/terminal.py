@@ -341,6 +341,13 @@ class RunCommandTool(Tool):
                 )
 
             timeout = args.timeout or config.command_timeout
+            cmd_lower = args.command.lower()
+            is_installer_cmd = any(
+                kw in cmd_lower
+                for kw in ("pip install", "npm install", "npm i ", "yarn install", "pnpm install", "cargo build", "cargo check")
+            )
+            if args.timeout is None and is_installer_cmd:
+                timeout = max(timeout, 300)
             pm = get_process_manager()
 
             logger.info(f"Executing command in {cwd} (background={args.background}): {args.command}")
@@ -409,8 +416,12 @@ class RunCommandTool(Tool):
                 return ToolResult(
                     success=False,
                     error=(
-                        f"Command timed out after {timeout} seconds. "
-                        f"If '{args.command}' is a long-running bot, server, or watcher, re-run with background=true."
+                        f"Command timed out after {timeout} seconds."
+                        + (
+                            " Package installation took longer than expected; re-run with a higher timeout."
+                            if is_installer_cmd
+                            else f" If '{args.command}' is a long-running bot, server, or watcher, re-run with background=true."
+                        )
                     ),
                     output={
                         "process_id": managed.process_id,
@@ -428,7 +439,13 @@ class RunCommandTool(Tool):
 
             error_msg = None
             if rc != 0:
-                error_msg = stderr_text.strip() or stdout_text.strip() or f"Command '{args.command}' failed with exit code {rc}"
+                err_s = stderr_text.strip()
+                out_s = stdout_text.strip()
+                if err_s and out_s and out_s != err_s:
+                    # Include stdout tail so warnings on stderr (e.g. pytest) don't hide the real error
+                    error_msg = f"{err_s}\n\n{out_s[-1500:]}"
+                else:
+                    error_msg = err_s or out_s or f"Command '{args.command}' failed with exit code {rc}"
 
             return ToolResult(
                 success=rc == 0,

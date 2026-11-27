@@ -83,6 +83,17 @@ class ModelRateLimiter:
         except Exception:
             pass
 
+    def get_daily_usage(self, model_name: str = "", base_url: str = "") -> Dict[str, Any]:
+        """Return today's Google RPD usage stats (Pacific Time)."""
+        is_google = self.is_google_request(model_name, base_url)
+        self._load_daily_usage()
+        return {
+            "is_google": is_google,
+            "used": self._daily_count,
+            "limit": GOOGLE_PEAK_RPD,
+            "date_pt": self._daily_date,
+        }
+
     @staticmethod
     def is_google_request(model_name: str, base_url: str = "") -> bool:
         """Detect whether a request targets Google Gemini / Gemma."""
