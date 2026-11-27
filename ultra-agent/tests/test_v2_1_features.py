@@ -227,4 +227,59 @@ def test_conversational_greeting_detection():
     assert ctrl._is_conversational("fix the bug in app.py") is False
 
 
+def test_google_provider_preset_and_sync(monkeypatch, tmp_path):
+    from agent.config import (
+        GOOGLE_GEMINI_BASE_URL,
+        GOOGLE_GEMINI_DEFAULT_MODEL,
+        GOOGLE_GEMINI_GEMMA_MODEL,
+        MODEL_RATE_LIMITS_RPM,
+    )
+
+    assert GOOGLE_GEMINI_BASE_URL == "https://generativelanguage.googleapis.com/v1beta/openai/"
+    assert GOOGLE_GEMINI_DEFAULT_MODEL == "gemini-3.5-flash-lite"
+    assert GOOGLE_GEMINI_GEMMA_MODEL == "gemma-4-31b-it"
+    assert MODEL_RATE_LIMITS_RPM["gemini-3.5-flash-lite"] == 15
+    assert MODEL_RATE_LIMITS_RPM["gemma-4-31b-it"] == 30
+
+    monkeypatch.setattr("agent.config.CONFIG_DIR", tmp_path / ".ireri-code")
+    monkeypatch.setattr("agent.config.CONFIG_FILE", tmp_path / ".ireri-code" / "config.json")
+    monkeypatch.setattr("agent.config.PROFILES_FILE", tmp_path / ".ireri-code" / "profiles.json")
+    monkeypatch.chdir(tmp_path)
+    reset_config()
+
+    cfg = sync_api_credentials(
+        api_key="AIza-test-key",
+        base_url=GOOGLE_GEMINI_BASE_URL,
+        model=GOOGLE_GEMINI_DEFAULT_MODEL,
+    )
+    assert cfg.openai_model == "gemini-3.5-flash-lite"
+    profiles = get_profiles()
+    assert "google" in profiles
+    assert profiles["google"]["model"] == "gemini-3.5-flash-lite"
+
+
+@pytest.mark.asyncio
+async def test_model_rate_limiter_waits_for_reset(monkeypatch):
+    from agent.model import ModelRateLimiter
+
+    limiter = ModelRateLimiter(window_seconds=0.15)
+    assert limiter.get_rpm_limit("gemini-3.5-flash-lite") == 15
+    assert limiter.get_rpm_limit("models/gemini-3.5-flash-lite") == 15
+    assert limiter.get_rpm_limit("gemma-4-31b-it") == 30
+    assert limiter.get_rpm_limit("gpt-4o-mini") is None
+
+    # Patch to 2 calls per 0.15s window for fast deterministic test
+    monkeypatch.setitem(__import__("agent.config", fromlist=["MODEL_RATE_LIMITS_RPM"]).MODEL_RATE_LIMITS_RPM, "gemini-3.5-flash-lite", 2)
+
+    events = []
+    await limiter.acquire("gemini-3.5-flash-lite", progress_callback=lambda ev, d: events.append((ev, d)))
+    await limiter.acquire("gemini-3.5-flash-lite", progress_callback=lambda ev, d: events.append((ev, d)))
+    assert events == []
+
+    waited = await limiter.acquire("gemini-3.5-flash-lite", progress_callback=lambda ev, d: events.append((ev, d)))
+    assert waited > 0
+    assert any(ev == "rate_limit_wait" and d["rpm_limit"] == 2 for ev, d in events)
+
+
+
 

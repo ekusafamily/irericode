@@ -18,6 +18,16 @@ PROFILES_FILE = CONFIG_DIR / "profiles.json"
 NVIDIA_NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_NIM_DEFAULT_MODEL = "nvidia/nemotron-3.5-super-vl-120b-a12b"
 
+GOOGLE_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+GOOGLE_GEMINI_DEFAULT_MODEL = "gemini-3.5-flash-lite"
+GOOGLE_GEMINI_GEMMA_MODEL = "gemma-4-31b-it"
+
+# Per-model calls-per-minute (RPM) limits
+MODEL_RATE_LIMITS_RPM: Dict[str, int] = {
+    "gemini-3.5-flash-lite": 15,
+    "gemma-4-31b-it": 30,
+}
+
 
 class AgentConfig(BaseSettings):
     """Agent configuration loaded from global config file."""
@@ -246,6 +256,8 @@ def sync_api_credentials(
     if profile_name is None:
         if "nvidia.com" in eff_base_url.lower():
             profile_name = "nvidia"
+        elif "generativelanguage.googleapis.com" in eff_base_url.lower():
+            profile_name = "google"
         elif "openai.com" in eff_base_url.lower():
             profile_name = "openai"
         elif "openrouter.ai" in eff_base_url.lower():

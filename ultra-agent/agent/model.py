@@ -1,15 +1,17 @@
 """Model client for ireri."""
 
 import os
+import time
 import asyncio
 import logging
+from collections import deque
 from typing import Any, Callable, Dict, List, Optional, AsyncGenerator
 from dataclasses import dataclass
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
-from agent.config import get_config
+from agent.config import get_config, MODEL_RATE_LIMITS_RPM
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +20,82 @@ RETRY_DELAYS = [1, 5, 15, 30, 60, 180]
 
 # Maximum time to wait for a model response before diagnosing & reloading connection (3 mins = 180s)
 MODEL_CALL_TIMEOUT = 180.0
+
+
+class ModelRateLimiter:
+    """Per-model sliding-window rate limiter (calls per minute)."""
+
+    def __init__(self, window_seconds: float = 60.0):
+        self.window_seconds = window_seconds
+        self._calls: Dict[str, deque] = {}
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def get_rpm_limit(model_name: str) -> Optional[int]:
+        """Return configured calls-per-minute limit for a model, or None if unlimited."""
+        if not model_name:
+            return None
+        normalized = model_name.strip().lower()
+        if normalized.startswith("models/"):
+            normalized = normalized[len("models/"):]
+        if normalized in MODEL_RATE_LIMITS_RPM:
+            return MODEL_RATE_LIMITS_RPM[normalized]
+        for key, limit in MODEL_RATE_LIMITS_RPM.items():
+            if normalized.startswith(key):
+                return limit
+        return None
+
+    async def acquire(
+        self,
+        model_name: str,
+        progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ) -> float:
+        """Wait if the model's per-minute limit is reached until the next minute window opens.
+
+        Returns the total seconds waited.
+        """
+        rpm_limit = self.get_rpm_limit(model_name)
+        if rpm_limit is None or rpm_limit <= 0:
+            return 0.0
+
+        key = model_name.strip().lower()
+        if key.startswith("models/"):
+            key = key[len("models/"):]
+
+        total_waited = 0.0
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                history = self._calls.setdefault(key, deque())
+                while history and (now - history[0]) >= self.window_seconds:
+                    history.popleft()
+
+                if len(history) < rpm_limit:
+                    history.append(now)
+                    return total_waited
+
+                wait_seconds = max(0.05, self.window_seconds - (now - history[0]) + 0.05)
+
+            if progress_callback:
+                progress_callback("rate_limit_wait", {
+                    "model": model_name,
+                    "rpm_limit": rpm_limit,
+                    "wait_seconds": wait_seconds,
+                })
+            logger.info(
+                f"Rate limit reached for {model_name} ({rpm_limit} calls/min). "
+                f"Waiting {wait_seconds:.1f}s for next minute reset..."
+            )
+            await asyncio.sleep(wait_seconds)
+            total_waited += wait_seconds
+
+
+_rate_limiter = ModelRateLimiter()
+
+
+def get_rate_limiter() -> ModelRateLimiter:
+    """Get the global per-model rate limiter."""
+    return _rate_limiter
 
 
 async def diagnose_connection(base_url: str, api_key: str, timeout: float = 8.0) -> Dict[str, Any]:
@@ -158,6 +236,7 @@ class ModelClient:
                         kwargs["tool_choice"] = tool_choice
 
                 try:
+                    await _rate_limiter.acquire(self.model, progress_callback=cb)
                     if stream:
                         response = await asyncio.wait_for(
                             self._stream_chat(

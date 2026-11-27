@@ -221,6 +221,18 @@ def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["Thi
         console.print(f"\n  [green]✓[/green] API call recovered on retry attempt {data.get('attempt')}\n")
         if thinking:
             thinking.start("[bold bright_cyan]Thinking...[/bold bright_cyan]")
+    elif event == "rate_limit_wait":
+        if thinking:
+            thinking.stop()
+        model_name = data.get("model", "model")
+        rpm = data.get("rpm_limit", "?")
+        wait_s = data.get("wait_seconds", 60)
+        console.print(
+            f"\n  [yellow]⏳ Rate limit reached for [bold]{model_name}[/bold] ({rpm} calls/min). "
+            f"Waiting {wait_s:.1f}s for next minute reset...[/yellow]"
+        )
+        if thinking:
+            thinking.start(f"[bold yellow]Waiting {wait_s:.1f}s for {model_name} rate limit reset...[/bold yellow]")
     elif event == "model_timeout":
         if thinking:
             thinking.stop()
@@ -503,6 +515,8 @@ async def _prompt_tool_approval_interactive(
 async def _run_first_time_setup(config: AgentConfig) -> None:
     """Beginner-friendly first-run onboarding when no API key is configured."""
     from agent.config import (
+        GOOGLE_GEMINI_BASE_URL,
+        GOOGLE_GEMINI_DEFAULT_MODEL,
         NVIDIA_NIM_BASE_URL,
         NVIDIA_NIM_DEFAULT_MODEL,
         sync_api_credentials,
@@ -513,10 +527,9 @@ async def _run_first_time_setup(config: AgentConfig) -> None:
         "[bold bright_cyan]Welcome to IRERI CODE![/bold bright_cyan]\n"
         "No API key is configured yet. Let's set up your AI provider in seconds\n"
         "(or skip and configure later using [cyan]/provider[/cyan]).\n\n"
-        "[bold bright_yellow]★ Recommended for Beginners: NVIDIA NIM (Free Tier)[/bold bright_yellow]\n"
-        "• Free API credits at [underline cyan]https://build.nvidia.com/[/underline cyan]\n"
-        f"• Preset Base URL: [dim]{NVIDIA_NIM_BASE_URL}[/dim]\n"
-        f"• Preset Model: [green]{NVIDIA_NIM_DEFAULT_MODEL}[/green]",
+        "[bold bright_yellow]★ Free Tier Presets Available ★[/bold bright_yellow]\n"
+        f"• [bold]Google Gemini:[/bold] [green]{GOOGLE_GEMINI_DEFAULT_MODEL}[/green] (15 RPM) / [green]gemma-4-31b-it[/green] (30 RPM) — [underline cyan]https://aistudio.google.com/apikey[/underline cyan]\n"
+        f"• [bold]NVIDIA NIM:[/bold]    [green]{NVIDIA_NIM_DEFAULT_MODEL}[/green] — [underline cyan]https://build.nvidia.com/[/underline cyan]",
         title="[bold green]Quick Setup[/bold green]",
         border_style="bright_cyan",
         box=ROUNDED,
@@ -530,8 +543,13 @@ async def _run_first_time_setup(config: AgentConfig) -> None:
                 title="Choose how to configure ireri:",
                 options=[
                     {
+                        "key": "google",
+                        "label": f"★ Google Gemini Preset (Free Tier — {GOOGLE_GEMINI_DEFAULT_MODEL}, 15 RPM)",
+                        "pt_style": "class:allow",
+                    },
+                    {
                         "key": "nvidia",
-                        "label": f"★ NVIDIA NIM Preset (Free Tier — only enter API key)",
+                        "label": "★ NVIDIA NIM Preset (Free Tier — only enter API key)",
                         "pt_style": "class:allow",
                     },
                     {
@@ -545,7 +563,7 @@ async def _run_first_time_setup(config: AgentConfig) -> None:
                         "pt_style": "class:item",
                     },
                 ],
-                hotkeys={"1": "nvidia", "2": "custom", "3": "skip"},
+                hotkeys={"1": "google", "2": "nvidia", "3": "custom", "4": "skip"},
             )
         except Exception:
             choice = None
@@ -554,7 +572,28 @@ async def _run_first_time_setup(config: AgentConfig) -> None:
         return
 
     loop = asyncio.get_event_loop()
-    if choice == "nvidia":
+    if choice == "google":
+        console.print(f"\n[dim]Get a free Google Gemini API key at: https://aistudio.google.com/apikey[/dim]")
+        entered_key = (await loop.run_in_executor(
+            None,
+            lambda: Prompt.ask("[bold cyan]Enter Google Gemini API Key (AIza... or Enter to skip)[/bold cyan]", default=""),
+        )).strip()
+        sync_api_credentials(
+            api_key=entered_key,
+            base_url=GOOGLE_GEMINI_BASE_URL,
+            model=GOOGLE_GEMINI_DEFAULT_MODEL,
+            profile_name="google",
+        )
+        if entered_key:
+            console.print(render_system_message(
+                f"[green]✓ Google Gemini configured and synced![/green]\n"
+                f"Default Model: [cyan]{GOOGLE_GEMINI_DEFAULT_MODEL}[/cyan] (15 calls/min limit)  •  Change anytime with [bold]/model[/bold]"
+            ))
+        else:
+            console.print(render_system_message(
+                "[yellow]Skipped API key. Google Gemini preset URL & model saved — run /provider google anytime.[/yellow]"
+            ))
+    elif choice == "nvidia":
         console.print(f"\n[dim]Get a free NVIDIA API key at: https://build.nvidia.com/[/dim]")
         entered_key = (await loop.run_in_executor(
             None,
@@ -671,7 +710,7 @@ async def _chat_async(
     for line in banner_lines:
         console.print(f"[bold bright_cyan]{line}[/bold bright_cyan]")
     console.print()
-    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.1.3[/bold bright_green]")
+    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.1.4[/bold bright_green]")
     console.print()
     key_status = "[green]Configured[/green]" if config.openai_api_key else "[yellow]Not set (/provider)[/yellow]"
     console.print(render_system_message(
@@ -1103,7 +1142,7 @@ SLASH_COMMANDS = {
     "/ps": "List or stop ongoing background processes (/ps [stop <id>])",
     "/tokens": "View session tokens sent/received and approximate context length",
     "/help": "Display all available commands",
-    "/provider": "Configure AI providers (NVIDIA, OpenAI, etc.)",
+    "/provider": "Configure AI providers (Google, NVIDIA, OpenAI, etc.)",
     "/settings": "Open interactive settings & API profiles",
     "/model": "View or switch AI models",
     "/models": "List available models",
@@ -2289,8 +2328,9 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
                     })
 
                 menu_opts.extend([
+                    {"key": "add_google", "label": "★ Add / Update Google Gemini Preset (gemini-3.5-flash-lite / gemma-4-31b-it)", "pt_style": "class:allow"},
                     {"key": "add_nvidia", "label": "★ Add / Update NVIDIA NIM Preset (Free Tier — only API key)", "pt_style": "class:allow"},
-                    {"key": "add_wizard", "label": "+ Add Provider (NVIDIA, OpenAI, OpenRouter, Groq, Custom)", "pt_style": "class:accent"},
+                    {"key": "add_wizard", "label": "+ Add Provider (Google, NVIDIA, OpenAI, OpenRouter, Groq, Custom)", "pt_style": "class:accent"},
                     {"key": "model", "label": "◈ Switch Model (/model)", "pt_style": "class:item"},
                     {"key": "tools", "label": "🛡 Edit Tool Access (/settings tools)", "pt_style": "class:item"},
                     {"key": "edit", "label": "⚙ Edit Settings (/settings edit)", "pt_style": "class:item"},
@@ -2308,6 +2348,8 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
                         reset_model_client()
                         controller.model_client = get_model_client()
                         console.print(render_system_message(f"[green]✓ Switched active provider to '{pname}'.[/green]"))
+                elif action == "add_google":
+                    await _handle_provider_command(["/provider", "google"], controller)
                 elif action == "add_nvidia":
                     await _handle_provider_command(["/provider", "nvidia"], controller)
                 elif action == "add_wizard":
@@ -2384,6 +2426,64 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
         console.print()
         return
 
+    elif subcommand == "google":
+        from agent.config import (
+            GOOGLE_GEMINI_BASE_URL,
+            GOOGLE_GEMINI_DEFAULT_MODEL,
+            GOOGLE_GEMINI_GEMMA_MODEL,
+            sync_api_credentials,
+        )
+        console.print()
+        console.print(Panel(
+            "[bold bright_cyan]Google Gemini Provider Setup (Preset)[/bold bright_cyan]\n"
+            f"• Base URL: [cyan]{GOOGLE_GEMINI_BASE_URL}[/cyan]\n"
+            f"• Default Model: [green]{GOOGLE_GEMINI_DEFAULT_MODEL}[/green] (15 calls/min)\n"
+            f"• Gemma Model:   [green]{GOOGLE_GEMINI_GEMMA_MODEL}[/green] (30 calls/min)\n"
+            "Get your free API key at: [bold underline cyan]https://aistudio.google.com/apikey[/bold underline cyan]",
+            title="[bold green]Google Gemini[/bold green]",
+            border_style="green",
+            box=ROUNDED,
+        ))
+
+        api_key = Prompt.ask("[bold cyan]Enter Google Gemini API Key (AIza...)[/bold cyan]").strip()
+        if not api_key:
+            console.print("[yellow]Setup cancelled: API key required.[/yellow]")
+            return
+
+        selected_model = GOOGLE_GEMINI_DEFAULT_MODEL
+        if sys.stdin.isatty():
+            picked = await _prompt_arrow_menu(
+                title="Select Default Google Model:",
+                options=[
+                    {
+                        "key": GOOGLE_GEMINI_DEFAULT_MODEL,
+                        "label": f"★ {GOOGLE_GEMINI_DEFAULT_MODEL} (Default — 15 calls/min)",
+                        "pt_style": "class:allow",
+                    },
+                    {
+                        "key": GOOGLE_GEMINI_GEMMA_MODEL,
+                        "label": f"  {GOOGLE_GEMINI_GEMMA_MODEL} (30 calls/min)",
+                        "pt_style": "class:accent",
+                    },
+                ],
+            )
+            if picked:
+                selected_model = picked
+
+        sync_api_credentials(
+            api_key=api_key,
+            base_url=GOOGLE_GEMINI_BASE_URL,
+            model=selected_model,
+            profile_name="google",
+        )
+        reset_model_client()
+        controller.model_client = get_model_client()
+        console.print(render_system_message(
+            f"[green]Google Gemini configured & synced with model '{selected_model}'![/green]\n"
+            f"[dim]Per-minute rate limiting is active automatically. Change model anytime with /model[/dim]"
+        ))
+        return
+
     elif subcommand == "nvidia":
         from agent.config import NVIDIA_NIM_BASE_URL, NVIDIA_NIM_DEFAULT_MODEL, sync_api_credentials
         console.print()
@@ -2418,7 +2518,13 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
         return
 
     elif subcommand == "add":
-        from agent.config import NVIDIA_NIM_BASE_URL, NVIDIA_NIM_DEFAULT_MODEL, sync_api_credentials
+        from agent.config import (
+            GOOGLE_GEMINI_BASE_URL,
+            GOOGLE_GEMINI_DEFAULT_MODEL,
+            NVIDIA_NIM_BASE_URL,
+            NVIDIA_NIM_DEFAULT_MODEL,
+            sync_api_credentials,
+        )
         name = parts[2] if len(parts) > 2 else ""
 
         if not name:
@@ -2426,6 +2532,7 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
                 choice = await _prompt_arrow_menu(
                     title="Select Provider Template:",
                     options=[
+                        {"key": "0", "label": "★ Google Gemini (Free Tier — aistudio.google.com/apikey)", "pt_style": "class:allow"},
                         {"key": "1", "label": "★ NVIDIA NIM (Recommended Free Tier — build.nvidia.com)", "pt_style": "class:allow"},
                         {"key": "2", "label": "OpenAI (https://api.openai.com/v1)", "pt_style": "class:accent"},
                         {"key": "3", "label": "OpenRouter (https://openrouter.ai/api/v1)", "pt_style": "class:accent"},
@@ -2439,14 +2546,20 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
             else:
                 console.print()
                 console.print("[bold cyan]Select provider template:[/bold cyan]")
+                console.print("  [bold]0[/bold]) Google Gemini (Free Tier - https://aistudio.google.com/apikey)")
                 console.print("  [bold]1[/bold]) NVIDIA NIM ([green]Recommended Free Tier[/green] - https://build.nvidia.com/)")
                 console.print("  [bold]2[/bold]) OpenAI (https://api.openai.com/v1)")
                 console.print("  [bold]3[/bold]) OpenRouter (https://openrouter.ai/api/v1)")
                 console.print("  [bold]4[/bold]) Groq (https://api.groq.com/openai/v1)")
                 console.print("  [bold]5[/bold]) Custom OpenAI-compatible URL")
-                choice = Prompt.ask("[bold cyan]Choice[/bold cyan]", choices=["1", "2", "3", "4", "5"], default="1")
+                choice = Prompt.ask("[bold cyan]Choice[/bold cyan]", choices=["0", "1", "2", "3", "4", "5"], default="0")
 
-            if choice == "1":
+            if choice == "0":
+                name = "google"
+                default_url = GOOGLE_GEMINI_BASE_URL
+                default_model = GOOGLE_GEMINI_DEFAULT_MODEL
+                console.print("[dim]Get free API key: https://aistudio.google.com/apikey[/dim]")
+            elif choice == "1":
                 name = "nvidia"
                 default_url = NVIDIA_NIM_BASE_URL
                 default_model = NVIDIA_NIM_DEFAULT_MODEL
@@ -2468,7 +2581,11 @@ async def _handle_provider_command(parts: list, controller: AgentController) -> 
                 default_url = "https://api.openai.com/v1"
                 default_model = "gpt-4o-mini"
         else:
-            if name.lower() == "nvidia":
+            if name.lower() == "google":
+                default_url = GOOGLE_GEMINI_BASE_URL
+                default_model = GOOGLE_GEMINI_DEFAULT_MODEL
+                console.print("[dim]Get free API key: https://aistudio.google.com/apikey[/dim]")
+            elif name.lower() == "nvidia":
                 default_url = NVIDIA_NIM_BASE_URL
                 default_model = NVIDIA_NIM_DEFAULT_MODEL
                 console.print("[dim]Register for free key: https://build.nvidia.com/[/dim]")
@@ -3099,7 +3216,7 @@ def _show_config_command() -> None:
 def _show_version_command() -> None:
     """Handle /version command."""
     console.print(Panel(
-        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.1.3[/bright_green]\n"
+        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.1.4[/bright_green]\n"
         "Terminal AI Coding Agent\n"
         "https://github.com/ekusafamily/ireri-code",
         title="[bold]Version Info[/bold]",
