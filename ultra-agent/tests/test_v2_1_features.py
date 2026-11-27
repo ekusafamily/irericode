@@ -426,6 +426,50 @@ async def test_google_tpm_and_rpd_limits(monkeypatch, tmp_path):
         await limiter.acquire("gemini-3.5-flash-lite", est_input_tokens=100)
 
 
+@pytest.mark.asyncio
+async def test_read_file_dedup_default_cap_and_compact(monkeypatch, tmp_path):
+    from agent.context import ContextManager
+    from agent.tools.files import ReadFileArgs, ReadFileTool
+
+    monkeypatch.chdir(tmp_path)
+    reset_config()
+    get_config().workspace_root = tmp_path
+
+    # 1. read_file default 200-line cap
+    big_file = tmp_path / "big.txt"
+    big_file.write_text("\n".join(f"line {i}" for i in range(350)), encoding="utf-8")
+    res = await ReadFileTool().execute(ReadFileArgs(path="big.txt"))
+    assert res.success is True
+    assert res.output["total_lines"] == 350
+    assert res.output["end_line"] == 200
+    assert res.output["truncated"] is True
+
+    # 2. read_file deduplication + compact_history
+    ctx = ContextManager()
+    ctx.add_system_message("sys")
+    ctx.add_user_message("first")
+    ctx.add_assistant_message(
+        content=None,
+        tool_calls=[{"id": "r1", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "big.txt"}'}}],
+    )
+    ctx.add_tool_result("r1", "read_file", "old file content " * 20)
+    ctx.add_assistant_message(
+        content=None,
+        tool_calls=[{"id": "r2", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "big.txt"}'}}],
+    )
+    ctx.add_tool_result("r2", "read_file", "latest file content")
+
+    formatted = ctx.get_messages_for_model()
+    tool_msgs = [m for m in formatted if m["role"] == "tool"]
+    assert "superseded" in tool_msgs[0]["content"]
+    assert tool_msgs[1]["content"] == "latest file content"
+
+    before, after = ctx.compact_history(keep_recent_messages=2)
+    assert after < before
+    assert ctx.messages[0].role == "system"
+
+
+
 
 
 

@@ -130,21 +130,31 @@ class ReadFileTool(Tool):
             content = target.read_text(encoding="utf-8")
             lines = content.splitlines()
 
-            # Apply offset and limit
-            start = args.offset or 0
-            end = start + (args.limit or len(lines))
+            # Apply offset and default 200-line cap when limit is omitted to save prompt tokens
+            start = max(0, args.offset or 0)
+            effective_limit = args.limit if args.limit is not None else 200
+            end = min(len(lines), start + effective_limit)
             selected_lines = lines[start:end]
+            truncated = end < len(lines)
+
+            output_data: Dict[str, Any] = {
+                "path": args.path,
+                "content": "\n".join(selected_lines),
+                "total_lines": len(lines),
+                "start_line": start + 1 if lines else 0,
+                "end_line": end,
+            }
+            if truncated:
+                output_data["truncated"] = True
+                output_data["note"] = (
+                    f"Showing lines {start + 1}-{end} of {len(lines)}. "
+                    f"Pass offset={end} and limit=200 to read more."
+                )
 
             return ToolResult(
                 success=True,
-                output={
-                    "path": args.path,
-                    "content": "\n".join(selected_lines),
-                    "total_lines": len(lines),
-                    "start_line": start + 1,
-                    "end_line": min(end, len(lines)),
-                },
-                metadata={"size": target.stat().st_size}
+                output=output_data,
+                metadata={"size": target.stat().st_size, "truncated": truncated},
             )
         except UnicodeDecodeError:
             return ToolResult(success=False, error="File is not valid UTF-8 text")

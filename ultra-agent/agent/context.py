@@ -108,17 +108,39 @@ class ContextManager:
         omitted = len(text) - head - max(0, tail)
         return f"{text[:head]}\n...[omitted {omitted} chars]...\n{text[-tail:]}" if tail > 0 else text[:max_chars]
 
-    def get_messages_for_model(self, keep_recent_messages: int = 12) -> List[Dict[str, Any]]:
+    def get_messages_for_model(self, keep_recent_messages: int = 10) -> List[Dict[str, Any]]:
         """Get messages formatted for the model API, pruning bulky older tool payloads."""
         total = len(self.messages)
         cutoff = max(0, total - keep_recent_messages)
+        write_cutoff = max(0, total - 4)
         # Never split an assistant(tool_calls) from its following tool messages
         while cutoff > 0 and cutoff < total and self.messages[cutoff].role == "tool":
             cutoff -= 1
+        while write_cutoff > 0 and write_cutoff < total and self.messages[write_cutoff].role == "tool":
+            write_cutoff -= 1
+
+        # Map read_file tool_call_id -> normalized path and find the latest read index per path
+        read_call_paths: Dict[str, str] = {}
+        latest_read_idx: Dict[str, int] = {}
+        for idx, msg in enumerate(self.messages):
+            if msg.role == "assistant" and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    fn = tc.get("function") or {}
+                    if fn.get("name") == "read_file":
+                        try:
+                            args_obj = json.loads(fn.get("arguments") or "{}")
+                            rpath = str(args_obj.get("path", "")).strip()
+                            if rpath and tc.get("id"):
+                                read_call_paths[tc["id"]] = rpath
+                        except Exception:
+                            pass
+            elif msg.role == "tool" and msg.tool_call_id in read_call_paths:
+                latest_read_idx[read_call_paths[msg.tool_call_id]] = idx
 
         result = []
         for idx, msg in enumerate(self.messages):
             is_old = idx < cutoff
+            is_old_write = idx < write_cutoff
             if msg.role == "system":
                 result.append({"role": "system", "content": msg.content})
             elif msg.role == "user":
@@ -130,12 +152,18 @@ class ContextManager:
                 if msg.tool_calls:
                     msg_dict["tool_calls"] = (
                         self._compact_old_tool_calls(msg.tool_calls)
-                        if is_old
+                        if is_old_write
                         else msg.tool_calls
                     )
                 result.append(msg_dict)
             elif msg.role == "tool":
-                content = self._truncate_text(msg.content, max_chars=400) if is_old else msg.content
+                rpath = read_call_paths.get(msg.tool_call_id or "")
+                if rpath and latest_read_idx.get(rpath, idx) > idx:
+                    content = f"[superseded by newer read of {rpath}]"
+                elif is_old:
+                    content = self._truncate_text(msg.content, max_chars=400)
+                else:
+                    content = msg.content
                 result.append({
                     "role": "tool",
                     "tool_call_id": msg.tool_call_id,
@@ -235,6 +263,37 @@ class ContextManager:
             if removed.role == "assistant" and removed.tool_calls:
                 while pop_idx < len(self.messages) and self.messages[pop_idx].role == "tool":
                     self.messages.pop(pop_idx)
+
+    def compact_history(self, keep_recent_messages: int = 4) -> tuple[int, int]:
+        """Fold older non-system messages into a concise summary to minimize tokens.
+
+        Returns (tokens_before, tokens_after).
+        """
+        before = self.estimate_tokens()
+        system_msgs = [m for m in self.messages if m.role == "system"]
+        non_system = [m for m in self.messages if m.role != "system"]
+        if len(non_system) <= keep_recent_messages:
+            return before, before
+
+        cutoff = len(non_system) - keep_recent_messages
+        while cutoff > 0 and non_system[cutoff].role == "tool":
+            cutoff -= 1
+
+        older = non_system[:cutoff]
+        recent = non_system[cutoff:]
+        if not older:
+            return before, before
+
+        user_count = sum(1 for m in older if m.role == "user")
+        files_list = sorted(self.files_inspected.keys())[:15]
+        files_note = f" Files touched/inspected: {', '.join(files_list)}." if files_list else ""
+        summary_entry = ContextEntry(
+            role="user",
+            content=f"[Compacted session summary: {user_count} earlier turn(s) completed.{files_note}]",
+        )
+        self.messages = system_msgs + [summary_entry] + recent
+        after = self.estimate_tokens()
+        return before, after
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize context for persistence."""

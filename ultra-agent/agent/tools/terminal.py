@@ -313,11 +313,7 @@ class RunCommandTool(Tool):
     """Execute a terminal command (foreground or background)."""
 
     name = "run_command"
-    description = (
-        "Execute a shell command in the workspace. For long-running processes like bots, servers, "
-        "or watchers (e.g., 'python bot.py', 'npm run dev'), set background=true so it returns "
-        "immediately with a process_id instead of blocking."
-    )
+    description = "Run a shell command in workspace (set background=true for bots/servers/watchers)."
     args_schema = RunCommandArgs
     requires_approval = True
     dangerous = True

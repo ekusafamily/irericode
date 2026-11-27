@@ -1312,6 +1312,7 @@ SLASH_COMMANDS = {
     "/logs": "View or follow live logs of an ongoing process (/logs [id|follow])",
     "/ps": "List or stop ongoing background processes (/ps [stop <id>])",
     "/tokens": "View session tokens sent/received and approximate context length",
+    "/compact": "Compact older conversation history to reduce prompt tokens",
     "/collapse": "Collapse or expand task outputs (with tokens shown at the side)",
     "/tasks": "Browse tasks interactively and toggle collapse/expand per task",
     "/help": "Display all available commands",
@@ -1339,6 +1340,7 @@ SLASH_COMMAND_ICONS = {
     "/logs": "📜",
     "/ps": "⚙",
     "/tokens": "📊",
+    "/compact": "🗜",
     "/collapse": "▸",
     "/tasks": "☰",
     "/help": "✦",
@@ -1531,6 +1533,14 @@ async def _handle_slash_command(command: str, controller: AgentController) -> No
 
     elif cmd == "/tokens":
         _show_tokens_command(controller)
+        return True
+
+    elif cmd == "/compact":
+        before, after = controller.context.compact_history()
+        controller.save_session()
+        console.print(render_system_message(
+            f"[green]✓ Compacted context:[/green] [yellow]~{format_tokens(before)}[/yellow] → [cyan]~{format_tokens(after)} tokens[/cyan]"
+        ))
         return True
 
     elif cmd == "/config":
