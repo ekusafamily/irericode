@@ -82,7 +82,23 @@ def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["Thi
     if event == "iteration_start":
         if thinking:
             thinking.stop()
-            thinking.start("[bold bright_cyan]Thinking...[/bold bright_cyan]")
+            ctx_toks = data.get("approx_context_tokens", 0)
+            if ctx_toks:
+                thinking.start(f"[bold bright_cyan]Thinking...[/bold bright_cyan]  [cyan]↑ {ctx_toks:,} tokens[/cyan]")
+            else:
+                thinking.start("[bold bright_cyan]Thinking...[/bold bright_cyan]")
+    elif event == "token_stream":
+        if thinking:
+            up = data.get("tokens_up", 0)
+            down = data.get("tokens_down", 0)
+            msg = (
+                f"[bold bright_cyan]Counting tokens...[/bold bright_cyan]  "
+                f"[cyan]↑ {up:,}[/cyan] [dim]|[/dim] [green]↓ {down:,}[/green] [dim]tokens[/dim]"
+            )
+            if thinking._status is None:
+                thinking.start(msg)
+            else:
+                thinking.update(msg)
     elif event == "model_response":
         if thinking:
             thinking.stop()
@@ -248,6 +264,15 @@ class ThinkingIndicator:
             try:
                 self._status = self.console.status(message, spinner="dots")
                 self._status.start()
+            except Exception:
+                pass
+        return _AwaitableNone()
+
+    def update(self, message: str):
+        """Update the spinner message in place (used for live token counting)."""
+        if self._status is not None:
+            try:
+                self._status.update(message)
             except Exception:
                 pass
         return _AwaitableNone()
@@ -646,7 +671,7 @@ async def _chat_async(
     for line in banner_lines:
         console.print(f"[bold bright_cyan]{line}[/bold bright_cyan]")
     console.print()
-    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.1.2[/bold bright_green]")
+    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.1.3[/bold bright_green]")
     console.print()
     key_status = "[green]Configured[/green]" if config.openai_api_key else "[yellow]Not set (/provider)[/yellow]"
     console.print(render_system_message(
@@ -706,6 +731,16 @@ async def _chat_async(
                 buf.cursor_position = len(matched)
         buf.validate_and_handle()
 
+    def _get_token_toolbar():
+        stats = controller.context.get_token_stats()
+        return HTML(
+            f" <b>Tokens:</b> "
+            f"<ansicyan>↑ {stats['tokens_up']:,} sent</ansicyan>  |  "
+            f"<ansigreen>↓ {stats['tokens_down']:,} received</ansigreen>  |  "
+            f"<ansimagenta>{stats['total_tokens']:,} total</ansimagenta>  |  "
+            f"<ansiyellow>Context ~{stats['approx_context_tokens']:,}</ansiyellow> "
+        )
+
     pt_session = PromptSession(
         erase_when_done=True,
         completer=pt_completer,
@@ -713,6 +748,7 @@ async def _chat_async(
         complete_style=CompleteStyle.COLUMN,
         style=SLASH_COMPLETION_STYLE,
         key_bindings=pt_kb,
+        bottom_toolbar=_get_token_toolbar,
     )
     approval_handoff_event = asyncio.Event()
 
@@ -3063,7 +3099,7 @@ def _show_config_command() -> None:
 def _show_version_command() -> None:
     """Handle /version command."""
     console.print(Panel(
-        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.1.2[/bright_green]\n"
+        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.1.3[/bright_green]\n"
         "Terminal AI Coding Agent\n"
         "https://github.com/ekusafamily/ireri-code",
         title="[bold]Version Info[/bold]",

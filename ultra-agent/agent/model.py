@@ -160,7 +160,11 @@ class ModelClient:
                 try:
                     if stream:
                         response = await asyncio.wait_for(
-                            self._stream_chat(**kwargs),
+                            self._stream_chat(
+                                progress_callback=cb,
+                                est_prompt_tokens=sum(len(str(m.get("content", ""))) for m in messages) // 4,
+                                **kwargs,
+                            ),
                             timeout=call_timeout,
                         )
                     else:
@@ -214,12 +218,103 @@ class ModelClient:
                     logger.error(f"Model API error exhausted all {len(delays)} retries: {e}")
                     raise
 
-    async def _stream_chat(self, **kwargs) -> ModelResponse:
-        """Handle streaming response."""
-        # For now, use non-streaming and simulate
-        # Full streaming implementation would accumulate chunks
-        response = await self.client.chat.completions.create(**kwargs, stream=False)
-        return self._parse_response(response)
+    async def _stream_chat(
+        self,
+        progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        est_prompt_tokens: int = 0,
+        **kwargs,
+    ) -> ModelResponse:
+        """Handle streaming response and emit real-time token_stream progress updates."""
+        stream_kwargs = dict(kwargs)
+        stream_kwargs["stream"] = True
+        stream_kwargs["stream_options"] = {"include_usage": True}
+
+        try:
+            stream_resp = await self.client.chat.completions.create(**stream_kwargs)
+        except Exception:
+            # Some OpenAI-compatible providers reject stream_options; retry plain stream=True
+            stream_kwargs.pop("stream_options", None)
+            try:
+                stream_resp = await self.client.chat.completions.create(**stream_kwargs)
+            except Exception:
+                # Fallback to non-streaming if provider doesn't support streaming
+                raw_response = await self.client.chat.completions.create(**kwargs, stream=False)
+                return self._parse_response(raw_response)
+
+        # If a mocked create() returned a non-async-iterable object, parse it directly
+        if not hasattr(stream_resp, "__aiter__"):
+            return self._parse_response(stream_resp)
+
+        content_parts: List[str] = []
+        tool_calls_map: Dict[int, Dict[str, Any]] = {}
+        finish_reason: Optional[str] = None
+        usage: Optional[Dict[str, Any]] = None
+        est_down = 0
+        char_count = 0
+
+        async for chunk in stream_resp:
+            if getattr(chunk, "usage", None):
+                u = chunk.usage
+                usage = {
+                    "prompt_tokens": getattr(u, "prompt_tokens", 0) or 0,
+                    "completion_tokens": getattr(u, "completion_tokens", 0) or 0,
+                    "total_tokens": getattr(u, "total_tokens", 0) or 0,
+                }
+                if usage["prompt_tokens"]:
+                    est_prompt_tokens = usage["prompt_tokens"]
+                if usage["completion_tokens"]:
+                    est_down = usage["completion_tokens"]
+
+            choices = getattr(chunk, "choices", None) or []
+            if choices:
+                choice = choices[0]
+                if getattr(choice, "finish_reason", None):
+                    finish_reason = choice.finish_reason
+                delta = getattr(choice, "delta", None)
+                if delta is not None:
+                    delta_content = getattr(delta, "content", None)
+                    if delta_content:
+                        content_parts.append(delta_content)
+                        char_count += len(delta_content)
+                        est_down = max(est_down + 1, char_count // 4)
+
+                    delta_tcs = getattr(delta, "tool_calls", None)
+                    if delta_tcs:
+                        for tc in delta_tcs:
+                            idx = getattr(tc, "index", 0) or 0
+                            if idx not in tool_calls_map:
+                                tool_calls_map[idx] = {
+                                    "id": getattr(tc, "id", None) or f"call_{idx}",
+                                    "type": getattr(tc, "type", None) or "function",
+                                    "function": {"name": "", "arguments": ""},
+                                }
+                            elif getattr(tc, "id", None):
+                                tool_calls_map[idx]["id"] = tc.id
+                            fn = getattr(tc, "function", None)
+                            if fn is not None:
+                                if getattr(fn, "name", None):
+                                    tool_calls_map[idx]["function"]["name"] += fn.name
+                                if getattr(fn, "arguments", None):
+                                    arg_chunk = fn.arguments
+                                    tool_calls_map[idx]["function"]["arguments"] += arg_chunk
+                                    char_count += len(arg_chunk)
+                                    est_down = max(est_down + 1, char_count // 4)
+
+            if progress_callback:
+                progress_callback("token_stream", {
+                    "tokens_up": est_prompt_tokens,
+                    "tokens_down": est_down,
+                })
+
+        tool_calls = [tool_calls_map[i] for i in sorted(tool_calls_map)] if tool_calls_map else None
+        full_content = "".join(content_parts) if content_parts else None
+        return ModelResponse(
+            content=full_content,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            usage=usage,
+            raw=None,
+        )
 
     def _parse_response(self, response) -> ModelResponse:
         """Parse OpenAI response into ModelResponse."""

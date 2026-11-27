@@ -199,6 +199,9 @@ class AgentController:
                 self.progress_callback("iteration_start", {
                     "iteration": iteration,
                     "max_iterations": max_iterations,
+                    "approx_context_tokens": self.context.estimate_tokens(),
+                    "total_tokens_up": self.context.total_prompt_tokens,
+                    "total_tokens_down": self.context.total_completion_tokens,
                 })
 
             try:
@@ -215,6 +218,7 @@ class AgentController:
                         tools=tools,
                         tool_choice="auto",
                         temperature=0.1,
+                        stream=bool(self.progress_callback),
                         progress_callback=self.progress_callback,
                     )
                 except Exception as e:
@@ -529,18 +533,22 @@ class AgentController:
 
     def _is_conversational(self, message: str) -> bool:
         """Check if message is a simple conversational input (not a coding task)."""
-        msg = message.strip().lower()
-        conversational_patterns = [
-            "hi", "hello", "hey", "hi there", "hello there",
+        import re
+        msg = re.sub(r"[!.,?]+$", "", message.strip().lower()).strip()
+        conversational_patterns = {
+            "hi", "hello", "hey", "yo", "sup", "howdy", "greetings",
+            "hi there", "hello there", "hey there",
+            "hi ireri", "hello ireri", "hey ireri",
+            "good morning", "good afternoon", "good evening", "good night",
+            "morning", "afternoon", "evening",
             "thanks", "thank you", "thx", "ty",
             "bye", "goodbye", "see you", "cya",
-            "how are you", "how's it going", "what's up",
+            "how are you", "how are you doing", "how's it going", "hows it going", "what's up", "whats up",
             "ok", "okay", "sure", "yeah", "yep", "yup",
             "no", "nope", "nah",
             "lol", "haha", "hehe",
-        ]
-        # Exact match or very short message
-        return msg in conversational_patterns or (len(msg) < 30 and msg in ["hi", "hello", "hey", "thanks", "bye", "ok"])
+        }
+        return msg in conversational_patterns
 
     def queue_message(self, message: str) -> int:
         """Queue a user message for upcoming run(s). Returns total queued count."""

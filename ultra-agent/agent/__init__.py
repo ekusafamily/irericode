@@ -6,7 +6,7 @@ from agent.context import ContextManager
 from agent.controller import AgentController, run_agent_task
 from agent.tools import Tool, ToolRegistry, get_registry, register_tool, ToolResult, ToolArgument
 
-__version__ = "2.1.2"
+__version__ = "2.1.3"
 
 __all__ = [
     "AgentConfig",

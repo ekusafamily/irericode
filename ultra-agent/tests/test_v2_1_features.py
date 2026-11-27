@@ -21,8 +21,8 @@ from agent.model import ModelClient, ModelResponse
 from agent.tools import Tool, ToolArgument, ToolRegistry, ToolResult
 
 
-def test_version_is_2_1_2():
-    assert __version__ == "2.1.2"
+def test_version_is_2_1_3():
+    assert __version__ == "2.1.3"
 
 
 def test_nvidia_nim_preset_constants():
@@ -171,5 +171,60 @@ async def test_get_process_logs_missing_id_includes_hint():
     res = await tool.execute(GetProcessLogsArgs(process_id="proc-999"))
     assert res.success is False
     assert "Process not found: proc-999" in res.error
+
+
+@pytest.mark.asyncio
+async def test_streaming_emits_real_time_token_counts():
+    """Streaming chat should emit live token_stream events as chunks arrive."""
+    client = ModelClient(api_key="test-key", base_url="http://test.local/v1", model="test-model")
+
+    class _Delta:
+        def __init__(self, content=None):
+            self.content = content
+            self.tool_calls = None
+
+    class _Choice:
+        def __init__(self, content=None, finish_reason=None):
+            self.delta = _Delta(content)
+            self.finish_reason = finish_reason
+
+    class _Chunk:
+        def __init__(self, content=None, finish_reason=None, usage=None):
+            self.choices = [_Choice(content, finish_reason)]
+            self.usage = usage
+
+    async def _fake_stream():
+        yield _Chunk("Hello ")
+        yield _Chunk("world!")
+        yield _Chunk(None, finish_reason="stop")
+
+    async def _fake_create(**kwargs):
+        return _fake_stream()
+
+    client.client.chat.completions.create = _fake_create
+    events = []
+    res = await client.chat(
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+        progress_callback=lambda ev, data: events.append((ev, data)),
+    )
+    assert res.content == "Hello world!"
+    stream_events = [d for ev, d in events if ev == "token_stream"]
+    assert len(stream_events) >= 2
+    assert stream_events[-1]["tokens_down"] >= stream_events[0]["tokens_down"]
+
+
+def test_conversational_greeting_detection():
+    mock_client = MagicMock(spec=ModelClient)
+    mock_client.model = "test-model"
+    mock_client.progress_callback = None
+    ctrl = AgentController(model_client=mock_client)
+
+    assert ctrl._is_conversational("hi!") is True
+    assert ctrl._is_conversational("good morning") is True
+    assert ctrl._is_conversational("Hello ireri!") is True
+    assert ctrl._is_conversational("create a python calculator") is False
+    assert ctrl._is_conversational("fix the bug in app.py") is False
+
 
 
