@@ -1,3 +1,4 @@
 remove auto reply from the agent 
 COUNT the total time for a specific task ,
 maybe output tok/sec for speccific task 
+if the text typed is long and has been pasted like from chatgpt , just show pasted text then the line count of the pasted content 
