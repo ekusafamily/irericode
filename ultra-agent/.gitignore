@@ -1,6 +1,7 @@
 # Environment
 .env
 .env.local
+known.bug
 
 # Python
 __pycache__/
