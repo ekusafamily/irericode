@@ -1,2 +1,4 @@
 collection of errors every 24 hrs and then we debug
 to a server maybe with database or telegram alerts . 
+interactive token count showing the token as they go up or down in real time 
+a default api KEY for new users 
