@@ -1,1 +1,3 @@
 remove auto reply from the agent 
+COUNT the total time for a specific task ,
+maybe output tok/sec for speccific task 
