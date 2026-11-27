@@ -205,6 +205,9 @@ class AgentController:
                 })
 
             try:
+                # Compact context if it grows too large, keeping tool-call pairs intact
+                self.context.trim_if_needed()
+
                 # Get messages for model
                 messages = self.context.get_messages_for_model()
 
@@ -334,6 +337,17 @@ class AgentController:
                         else:
                             tool_out_str = json.dumps(result.output) if isinstance(result.output, (dict, list)) else str(result.output)
 
+                        # Cap oversized tool output (e.g. verbose CLI/npm/tsc dumps) to save prompt tokens
+                        max_chars = 12000 if tool_call["function"]["name"] == "read_file" else 4000
+                        if len(tool_out_str) > max_chars:
+                            head = max_chars // 2
+                            tail = max_chars - head - 80
+                            omitted = len(tool_out_str) - head - max(0, tail)
+                            tool_out_str = (
+                                f"{tool_out_str[:head]}\n\n... [truncated {omitted} chars; use get_process_logs or read_file with offset/limit for more] ...\n\n"
+                                f"{tool_out_str[-tail:]}"
+                            )
+
                         # Add tool result to context
                         self.context.add_tool_result(
                             tool_call_id=tool_call["id"],
@@ -352,15 +366,9 @@ class AgentController:
                     self.save_session()
 
                 elif response.content:
-                    # Regular response - add to context and continue
+                    # Direct text response with no tool calls: return to user
                     self.context.add_assistant_message(content=response.content)
-
-                    # Check if task seems complete
-                    if self._is_task_complete(response.content):
-                        return response.content
-
-                    # Continue with continuation prompt
-                    self.context.add_user_message(get_continuation_prompt())
+                    return response.content
                 else:
                     # Empty response
                     logger.warning("Empty response from model")
@@ -535,8 +543,11 @@ class AgentController:
         """Check if message is a simple conversational input (not a coding task)."""
         import re
         msg = re.sub(r"[!.,?]+$", "", message.strip().lower()).strip()
+        # Collapse repeated trailing characters for casual greetings like "hiii", "hellooo", "heyyy"
+        collapsed = re.sub(r"(.)\1{2,}$", r"\1", msg)
         conversational_patterns = {
             "hi", "hello", "hey", "yo", "sup", "howdy", "greetings",
+            "bonjour", "salut", "hola", "mambo", "jambo", "sasa", "habari",
             "hi there", "hello there", "hey there",
             "hi ireri", "hello ireri", "hey ireri",
             "good morning", "good afternoon", "good evening", "good night",
@@ -548,7 +559,7 @@ class AgentController:
             "no", "nope", "nah",
             "lol", "haha", "hehe",
         }
-        return msg in conversational_patterns
+        return msg in conversational_patterns or collapsed in conversational_patterns
 
     def queue_message(self, message: str) -> int:
         """Queue a user message for upcoming run(s). Returns total queued count."""

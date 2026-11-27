@@ -28,6 +28,11 @@ MODEL_RATE_LIMITS_RPM: Dict[str, int] = {
     "gemma-4-31b-it": 30,
 }
 
+# Google AI Studio safety caps (below 250k TPM and 500 RPD, reset 12:00 AM PT)
+GOOGLE_PEAK_TPM = 220_000
+GOOGLE_PEAK_RPD = 490
+GOOGLE_USAGE_FILE = CONFIG_DIR / "google_usage.json"
+
 
 class AgentConfig(BaseSettings):
     """Agent configuration loaded from global config file."""

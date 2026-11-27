@@ -70,27 +70,77 @@ class ContextManager:
         """Add a system message (inserted at beginning)."""
         self.messages.insert(0, ContextEntry(role="system", content=content))
 
-    def get_messages_for_model(self) -> List[Dict[str, Any]]:
-        """Get messages formatted for the model API."""
+    @staticmethod
+    def _compact_old_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Shrink bulky write_file/edit_file payloads in older turns while preserving structure."""
+        compacted = []
+        for tc in tool_calls:
+            tc_copy = dict(tc)
+            fn = tc.get("function") or {}
+            fn_name = fn.get("name", "")
+            raw_args = fn.get("arguments", "")
+            if fn_name in ("write_file", "edit_file") and isinstance(raw_args, str) and len(raw_args) > 300:
+                try:
+                    parsed = json.loads(raw_args)
+                    if isinstance(parsed, dict):
+                        slim = {"path": parsed.get("path", "")}
+                        if "content" in parsed and isinstance(parsed["content"], str):
+                            line_count = parsed["content"].count("\n") + 1
+                            slim["note"] = f"[omitted {line_count} lines already written]"
+                        else:
+                            slim["note"] = "[omitted older edit payload]"
+                        tc_copy["function"] = {
+                            "name": fn_name,
+                            "arguments": json.dumps(slim),
+                        }
+                except Exception:
+                    pass
+            compacted.append(tc_copy)
+        return compacted
+
+    @staticmethod
+    def _truncate_text(text: str, max_chars: int = 400) -> str:
+        """Truncate long older tool output keeping head and tail."""
+        if not text or len(text) <= max_chars:
+            return text
+        head = max_chars // 2
+        tail = max_chars - head - 30
+        omitted = len(text) - head - max(0, tail)
+        return f"{text[:head]}\n...[omitted {omitted} chars]...\n{text[-tail:]}" if tail > 0 else text[:max_chars]
+
+    def get_messages_for_model(self, keep_recent_messages: int = 12) -> List[Dict[str, Any]]:
+        """Get messages formatted for the model API, pruning bulky older tool payloads."""
+        total = len(self.messages)
+        cutoff = max(0, total - keep_recent_messages)
+        # Never split an assistant(tool_calls) from its following tool messages
+        while cutoff > 0 and cutoff < total and self.messages[cutoff].role == "tool":
+            cutoff -= 1
+
         result = []
-        for msg in self.messages:
+        for idx, msg in enumerate(self.messages):
+            is_old = idx < cutoff
             if msg.role == "system":
                 result.append({"role": "system", "content": msg.content})
             elif msg.role == "user":
                 result.append({"role": "user", "content": msg.content})
             elif msg.role == "assistant":
-                msg_dict = {"role": "assistant"}
+                msg_dict: Dict[str, Any] = {"role": "assistant"}
                 if msg.content:
                     msg_dict["content"] = msg.content
                 if msg.tool_calls:
-                    msg_dict["tool_calls"] = msg.tool_calls
+                    msg_dict["tool_calls"] = (
+                        self._compact_old_tool_calls(msg.tool_calls)
+                        if is_old
+                        else msg.tool_calls
+                    )
                 result.append(msg_dict)
             elif msg.role == "tool":
+                content = self._truncate_text(msg.content, max_chars=400) if is_old else msg.content
                 result.append({
                     "role": "tool",
                     "tool_call_id": msg.tool_call_id,
                     "name": msg.name,
-                    "content": msg.content,
+                    "content": content,
                 })
         return result
 
@@ -157,25 +207,34 @@ class ContextManager:
         }
 
     def estimate_tokens(self) -> int:
-        """Rough token estimation."""
+        """Rough token estimation of the active model payload."""
         total = 0
-        for msg in self.messages:
-            total += len(msg.content) // 4  # rough estimate
-            if msg.tool_calls:
-                total += len(json.dumps(msg.tool_calls)) // 4
+        for msg in self.get_messages_for_model():
+            content = msg.get("content") or ""
+            total += len(content) // 4
+            if msg.get("tool_calls"):
+                total += len(json.dumps(msg["tool_calls"])) // 4
         return total
 
-    def trim_if_needed(self, model_max_tokens: int = 128_000) -> None:
-        """Trim context if it exceeds limits."""
-        # Reserve tokens for response and tools
-        available = model_max_tokens - 8000
+    def trim_if_needed(self, model_max_tokens: int = 36_000) -> None:
+        """Trim oldest non-system turn groups if context exceeds token budget."""
+        available = model_max_tokens - 6000
 
-        while self.estimate_tokens() > available and len(self.messages) > 2:
-            # Remove oldest non-system messages
+        while self.estimate_tokens() > available and len(self.messages) > 4:
+            # Find first non-system message
+            pop_idx = None
             for i, msg in enumerate(self.messages):
                 if msg.role != "system":
-                    self.messages.pop(i)
+                    pop_idx = i
                     break
+            if pop_idx is None:
+                break
+
+            removed = self.messages.pop(pop_idx)
+            # If we removed an assistant message with tool_calls, also remove its paired tool results
+            if removed.role == "assistant" and removed.tool_calls:
+                while pop_idx < len(self.messages) and self.messages[pop_idx].role == "tool":
+                    self.messages.pop(pop_idx)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize context for persistence."""

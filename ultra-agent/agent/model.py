@@ -1,17 +1,25 @@
 """Model client for ireri."""
 
 import os
+import json
 import time
 import asyncio
 import logging
 from collections import deque
+from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Dict, List, Optional, AsyncGenerator
 from dataclasses import dataclass
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
-from agent.config import get_config, MODEL_RATE_LIMITS_RPM
+from agent.config import (
+    get_config,
+    MODEL_RATE_LIMITS_RPM,
+    GOOGLE_PEAK_TPM,
+    GOOGLE_PEAK_RPD,
+    GOOGLE_USAGE_FILE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,13 +30,66 @@ RETRY_DELAYS = [1, 5, 15, 30, 60, 180]
 MODEL_CALL_TIMEOUT = 180.0
 
 
+def _pacific_today_str() -> str:
+    """Return today's date (YYYY-MM-DD) in US Pacific Time (America/Los_Angeles)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+    except Exception:
+        # Fallback to UTC-8 (PST) if system tzdata is unavailable
+        return datetime.now(timezone(timedelta(hours=-8))).strftime("%Y-%m-%d")
+
+
+class DailyQuotaExceededError(RuntimeError):
+    """Raised when the daily Google AI Studio request safety cap is reached."""
+
+
 class ModelRateLimiter:
-    """Per-model sliding-window rate limiter (calls per minute)."""
+    """Per-model sliding-window rate limiter (RPM, TPM, and Pacific-Time RPD)."""
 
     def __init__(self, window_seconds: float = 60.0):
         self.window_seconds = window_seconds
         self._calls: Dict[str, deque] = {}
+        self._token_calls: deque = deque()
+        self._daily_date: str = _pacific_today_str()
+        self._daily_count: int = 0
+        self._loaded_usage: bool = False
         self._lock = asyncio.Lock()
+
+    def _load_daily_usage(self) -> None:
+        today = _pacific_today_str()
+        if not self._loaded_usage:
+            self._loaded_usage = True
+            try:
+                if GOOGLE_USAGE_FILE.exists():
+                    data = json.loads(GOOGLE_USAGE_FILE.read_text(encoding="utf-8"))
+                    if data.get("date") == today:
+                        self._daily_date = today
+                        self._daily_count = int(data.get("count", 0))
+                        return
+            except Exception:
+                pass
+        if self._daily_date != today:
+            self._daily_date = today
+            self._daily_count = 0
+
+    def _save_daily_usage(self) -> None:
+        try:
+            GOOGLE_USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            GOOGLE_USAGE_FILE.write_text(
+                json.dumps({"date": self._daily_date, "count": self._daily_count}),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def is_google_request(model_name: str, base_url: str = "") -> bool:
+        """Detect whether a request targets Google Gemini / Gemma."""
+        if base_url and "generativelanguage.googleapis.com" in base_url.lower():
+            return True
+        low = (model_name or "").strip().lower()
+        return low.startswith("gemini-") or low.startswith("gemma-") or low.startswith("models/gemini-") or low.startswith("models/gemma-")
 
     @staticmethod
     def get_rpm_limit(model_name: str) -> Optional[int]:
@@ -49,45 +110,108 @@ class ModelRateLimiter:
         self,
         model_name: str,
         progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        est_input_tokens: int = 0,
+        base_url: str = "",
     ) -> float:
-        """Wait if the model's per-minute limit is reached until the next minute window opens.
+        """Enforce RPM, 220k TPM, and 490 RPD (Pacific Time) limits before calling the model.
 
         Returns the total seconds waited.
         """
+        is_google = self.is_google_request(model_name, base_url)
         rpm_limit = self.get_rpm_limit(model_name)
-        if rpm_limit is None or rpm_limit <= 0:
+        tpm_limit = GOOGLE_PEAK_TPM if is_google else None
+        rpd_limit = GOOGLE_PEAK_RPD if is_google else None
+
+        if rpm_limit is None and not is_google:
             return 0.0
 
-        key = model_name.strip().lower()
+        key = (model_name or "").strip().lower()
         if key.startswith("models/"):
             key = key[len("models/"):]
 
         total_waited = 0.0
         while True:
+            wait_seconds = 0.0
+            wait_reason = "rpm"
+            wait_limit: Any = rpm_limit
+
             async with self._lock:
                 now = time.monotonic()
+
+                # Check daily RPD cap (resets 12:00 AM Pacific Time)
+                if rpd_limit is not None:
+                    self._load_daily_usage()
+                    if self._daily_count >= rpd_limit:
+                        raise DailyQuotaExceededError(
+                            f"Daily Google API safety cap reached ({self._daily_count}/{rpd_limit} requests today; "
+                            f"Google AI Studio limit is 500 RPD). Resets at midnight Pacific Time (12:00 AM PT)."
+                        )
+
+                # Prune 60s RPM window
                 history = self._calls.setdefault(key, deque())
                 while history and (now - history[0]) >= self.window_seconds:
                     history.popleft()
 
-                if len(history) < rpm_limit:
+                # Prune 60s TPM window
+                while self._token_calls and (now - self._token_calls[0][0]) >= self.window_seconds:
+                    self._token_calls.popleft()
+
+                rpm_blocked = rpm_limit is not None and rpm_limit > 0 and len(history) >= rpm_limit
+                window_tokens = sum(tok for _, tok in self._token_calls)
+                tpm_blocked = (
+                    tpm_limit is not None
+                    and len(self._token_calls) > 0
+                    and (window_tokens + max(0, est_input_tokens)) > tpm_limit
+                )
+
+                if not rpm_blocked and not tpm_blocked:
                     history.append(now)
+                    if is_google:
+                        self._token_calls.append((now, max(0, est_input_tokens)))
+                        self._daily_count += 1
+                        self._save_daily_usage()
                     return total_waited
 
-                wait_seconds = max(0.05, self.window_seconds - (now - history[0]) + 0.05)
+                if rpm_blocked and tpm_blocked:
+                    rpm_wait = self.window_seconds - (now - history[0]) + 0.05
+                    tpm_wait = self.window_seconds - (now - self._token_calls[0][0]) + 0.05
+                    if tpm_wait > rpm_wait:
+                        wait_seconds = max(0.05, tpm_wait)
+                        wait_reason = "tpm"
+                        wait_limit = tpm_limit
+                    else:
+                        wait_seconds = max(0.05, rpm_wait)
+                        wait_reason = "rpm"
+                        wait_limit = rpm_limit
+                elif tpm_blocked:
+                    wait_seconds = max(0.05, self.window_seconds - (now - self._token_calls[0][0]) + 0.05)
+                    wait_reason = "tpm"
+                    wait_limit = tpm_limit
+                else:
+                    wait_seconds = max(0.05, self.window_seconds - (now - history[0]) + 0.05)
+                    wait_reason = "rpm"
+                    wait_limit = rpm_limit
 
-            if progress_callback:
-                progress_callback("rate_limit_wait", {
-                    "model": model_name,
-                    "rpm_limit": rpm_limit,
-                    "wait_seconds": wait_seconds,
-                })
+            end_time = time.monotonic() + wait_seconds
             logger.info(
-                f"Rate limit reached for {model_name} ({rpm_limit} calls/min). "
+                f"Rate limit ({wait_reason}) reached for {model_name}. "
                 f"Waiting {wait_seconds:.1f}s for next minute reset..."
             )
-            await asyncio.sleep(wait_seconds)
-            total_waited += wait_seconds
+            while True:
+                remaining = end_time - time.monotonic()
+                if remaining <= 0:
+                    break
+                if progress_callback:
+                    progress_callback("rate_limit_wait", {
+                        "model": model_name,
+                        "reason": wait_reason,
+                        "rpm_limit": wait_limit if wait_reason == "rpm" else None,
+                        "tpm_limit": wait_limit if wait_reason == "tpm" else None,
+                        "wait_seconds": remaining,
+                    })
+                step = min(1.0, remaining)
+                await asyncio.sleep(step)
+                total_waited += step
 
 
 _rate_limiter = ModelRateLimiter()
@@ -235,13 +359,19 @@ class ModelClient:
                     if tool_choice:
                         kwargs["tool_choice"] = tool_choice
 
+                est_prompt_tokens = sum(len(str(m.get("content", ""))) for m in messages) // 4
                 try:
-                    await _rate_limiter.acquire(self.model, progress_callback=cb)
+                    await _rate_limiter.acquire(
+                        self.model,
+                        progress_callback=cb,
+                        est_input_tokens=est_prompt_tokens,
+                        base_url=self.base_url,
+                    )
                     if stream:
                         response = await asyncio.wait_for(
                             self._stream_chat(
                                 progress_callback=cb,
-                                est_prompt_tokens=sum(len(str(m.get("content", ""))) for m in messages) // 4,
+                                est_prompt_tokens=est_prompt_tokens,
                                 **kwargs,
                             ),
                             timeout=call_timeout,
@@ -278,7 +408,13 @@ class ModelClient:
 
                 return response
 
+            except DailyQuotaExceededError:
+                raise
             except Exception as e:
+                status_code = getattr(e, "status_code", None)
+                if status_code == 400:
+                    logger.error(f"Model API 400 Bad Request (not retrying): {e}")
+                    raise
                 if attempt_idx < len(delays):
                     delay = delays[attempt_idx]
                     retry_num = attempt_idx + 1
@@ -369,6 +505,11 @@ class ModelClient:
                                 }
                             elif getattr(tc, "id", None):
                                 tool_calls_map[idx]["id"] = tc.id
+                            extra_content = getattr(tc, "extra_content", None) or (
+                                (getattr(tc, "model_extra", None) or {}).get("extra_content")
+                            )
+                            if extra_content:
+                                tool_calls_map[idx]["extra_content"] = extra_content
                             fn = getattr(tc, "function", None)
                             if fn is not None:
                                 if getattr(fn, "name", None):
@@ -402,8 +543,9 @@ class ModelClient:
 
         tool_calls = None
         if message.tool_calls:
-            tool_calls = [
-                {
+            tool_calls = []
+            for tc in message.tool_calls:
+                tc_dict = {
                     "id": tc.id,
                     "type": tc.type,
                     "function": {
@@ -411,8 +553,12 @@ class ModelClient:
                         "arguments": tc.function.arguments,
                     },
                 }
-                for tc in message.tool_calls
-            ]
+                extra_content = getattr(tc, "extra_content", None) or (
+                    (getattr(tc, "model_extra", None) or {}).get("extra_content")
+                )
+                if extra_content:
+                    tc_dict["extra_content"] = extra_content
+                tool_calls.append(tc_dict)
 
         usage = None
         if response.usage:

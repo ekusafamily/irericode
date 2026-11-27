@@ -33,6 +33,78 @@ app = typer.Typer(
 )
 
 
+def format_tokens(count: int) -> str:
+    """Format token counts compactly (e.g. 420 -> '420', 1000 -> '1k', 2742 -> '2.7k', 10000 -> '10k')."""
+    n = max(0, int(count or 0))
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        val = n / 1000.0
+        if val.is_integer() or n >= 100_000:
+            return f"{int(round(val))}k"
+        formatted = f"{val:.1f}".rstrip("0").rstrip(".")
+        return f"{formatted}k"
+    val = n / 1_000_000.0
+    if val.is_integer() or n >= 100_000_000:
+        return f"{int(round(val))}M"
+    formatted = f"{val:.1f}".rstrip("0").rstrip(".")
+    return f"{formatted}M"
+
+
+def render_task_with_side_tokens(
+    task: str,
+    result: str,
+    tokens_up: int,
+    tokens_down: int,
+    approx_context: int,
+    collapsed: bool = False,
+) -> Table:
+    """Render a task/response on the left and its token summary at the right side."""
+    task_preview = task.strip().replace("\n", " ")
+    if len(task_preview) > 64:
+        task_preview = task_preview[:61] + "..."
+
+    total = tokens_up + tokens_down
+    grid = Table.grid(expand=True)
+    grid.add_column(ratio=4)
+    grid.add_column(width=24, justify="right")
+
+    if collapsed:
+        left_panel = Panel(
+            f"[bold cyan]▸ {task_preview}[/bold cyan]  [dim](collapsed — /collapse to expand)[/dim]",
+            border_style="dim",
+            box=ROUNDED,
+            padding=(0, 1),
+        )
+        right_panel = Panel(
+            f"[cyan]↑{format_tokens(tokens_up)}[/cyan] [green]↓{format_tokens(tokens_down)}[/green] [magenta]Σ{format_tokens(total)}[/magenta]",
+            border_style="dim",
+            box=ROUNDED,
+            padding=(0, 1),
+        )
+    else:
+        left_panel = Panel(
+            Markdown(result),
+            title=f"[bold bright_green]▾ ireri[/bold bright_green] [dim]— {task_preview}[/dim]",
+            border_style="bright_green",
+            box=ROUNDED,
+            padding=(0, 1),
+        )
+        right_panel = Panel(
+            f"[cyan]↑ {format_tokens(tokens_up)}[/cyan] sent\n"
+            f"[green]↓ {format_tokens(tokens_down)}[/green] recv\n"
+            f"[magenta]Σ {format_tokens(total)}[/magenta] total\n"
+            f"[yellow]~{format_tokens(approx_context)}[/yellow] ctx",
+            title="[bold dim]Tokens[/bold dim]",
+            border_style="cyan",
+            box=ROUNDED,
+            padding=(0, 1),
+        )
+
+    grid.add_row(left_panel, right_panel)
+    return grid
+
+
 def render_user_message(content: str) -> Panel:
     """Render a user message on the right side."""
     panel = Panel(
@@ -84,7 +156,7 @@ def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["Thi
             thinking.stop()
             ctx_toks = data.get("approx_context_tokens", 0)
             if ctx_toks:
-                thinking.start(f"[bold bright_cyan]Thinking...[/bold bright_cyan]  [cyan]↑ {ctx_toks:,} tokens[/cyan]")
+                thinking.start(f"[bold bright_cyan]Thinking...[/bold bright_cyan]  [cyan]↑ {format_tokens(ctx_toks)} tokens[/cyan]")
             else:
                 thinking.start("[bold bright_cyan]Thinking...[/bold bright_cyan]")
     elif event == "token_stream":
@@ -93,7 +165,7 @@ def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["Thi
             down = data.get("tokens_down", 0)
             msg = (
                 f"[bold bright_cyan]Counting tokens...[/bold bright_cyan]  "
-                f"[cyan]↑ {up:,}[/cyan] [dim]|[/dim] [green]↓ {down:,}[/green] [dim]tokens[/dim]"
+                f"[cyan]↑ {format_tokens(up)}[/cyan] [dim]|[/dim] [green]↓ {format_tokens(down)}[/green] [dim]tokens[/dim]"
             )
             if thinking._status is None:
                 thinking.start(msg)
@@ -106,7 +178,7 @@ def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["Thi
         down = data.get("tokens_down", 0)
         tok_str = ""
         if up or down:
-            tok_str = f" [dim cyan](↑ {up:,} tokens sent, ↓ {down:,} tokens received)[/dim cyan]"
+            tok_str = f" [dim cyan](↑ {format_tokens(up)} sent, ↓ {format_tokens(down)} received)[/dim cyan]"
 
         if data.get("tool_calls_count", 0) > 0:
             console.print(f"\n  [cyan]Model: Planning {data['tool_calls_count']} tool call(s)[/cyan]{tok_str}")
@@ -223,16 +295,24 @@ def _progress_callback(event: str, data: Dict[str, Any], thinking: Optional["Thi
             thinking.start("[bold bright_cyan]Thinking...[/bold bright_cyan]")
     elif event == "rate_limit_wait":
         if thinking:
-            thinking.stop()
-        model_name = data.get("model", "model")
-        rpm = data.get("rpm_limit", "?")
-        wait_s = data.get("wait_seconds", 60)
-        console.print(
-            f"\n  [yellow]⏳ Rate limit reached for [bold]{model_name}[/bold] ({rpm} calls/min). "
-            f"Waiting {wait_s:.1f}s for next minute reset...[/yellow]"
-        )
-        if thinking:
-            thinking.start(f"[bold yellow]Waiting {wait_s:.1f}s for {model_name} rate limit reset...[/bold yellow]")
+            import math
+            model_name = data.get("model", "model")
+            reason = data.get("reason", "rpm")
+            secs = max(1, math.ceil(data.get("wait_seconds", 1)))
+            if reason == "tpm":
+                tpm = data.get("tpm_limit", 220_000)
+                limit_label = f"{format_tokens(tpm)} tokens/min"
+            else:
+                rpm = data.get("rpm_limit", "?")
+                limit_label = f"{rpm}/min"
+            msg = (
+                f"[bold yellow]⏳ Rate limit ({model_name}, {limit_label}) — "
+                f"resetting in {secs}s...[/bold yellow]"
+            )
+            if thinking._status is None:
+                thinking.start(msg)
+            else:
+                thinking.update(msg)
     elif event == "model_timeout":
         if thinking:
             thinking.stop()
@@ -710,7 +790,7 @@ async def _chat_async(
     for line in banner_lines:
         console.print(f"[bold bright_cyan]{line}[/bold bright_cyan]")
     console.print()
-    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.1.4[/bold bright_green]")
+    console.print("[bold bright_green]  Terminal AI Coding Agent  v2.1.6[/bold bright_green]")
     console.print()
     key_status = "[green]Configured[/green]" if config.openai_api_key else "[yellow]Not set (/provider)[/yellow]"
     console.print(render_system_message(
@@ -740,6 +820,8 @@ async def _chat_async(
             console.print()
 
     thinking = ThinkingIndicator(console)
+    tasks_collapsed = False
+    task_history: List[Dict[str, Any]] = []
 
     # Initialize prompt_toolkit session with auto-completion, Enter auto-select, and dynamic prompt
     from prompt_toolkit import PromptSession
@@ -772,12 +854,14 @@ async def _chat_async(
 
     def _get_token_toolbar():
         stats = controller.context.get_token_stats()
+        collapse_label = "Collapsed" if tasks_collapsed else "Expanded"
         return HTML(
             f" <b>Tokens:</b> "
-            f"<ansicyan>↑ {stats['tokens_up']:,} sent</ansicyan>  |  "
-            f"<ansigreen>↓ {stats['tokens_down']:,} received</ansigreen>  |  "
-            f"<ansimagenta>{stats['total_tokens']:,} total</ansimagenta>  |  "
-            f"<ansiyellow>Context ~{stats['approx_context_tokens']:,}</ansiyellow> "
+            f"<ansicyan>↑ {format_tokens(stats['tokens_up'])} sent</ansicyan>  |  "
+            f"<ansigreen>↓ {format_tokens(stats['tokens_down'])} recv</ansigreen>  |  "
+            f"<ansimagenta>Σ {format_tokens(stats['total_tokens'])}</ansimagenta>  |  "
+            f"<ansiyellow>~{format_tokens(stats['approx_context_tokens'])} ctx</ansiyellow>  |  "
+            f"<ansibrightblack>Tasks: {collapse_label} (/collapse)</ansibrightblack> "
         )
 
     pt_session = PromptSession(
@@ -863,6 +947,7 @@ async def _chat_async(
         """Background worker executing tasks from the queue in sequence while prompt stays active."""
         current_task = task
         while current_task and not controller.cancelled:
+            pre_stats = controller.context.get_token_stats()
             try:
                 result = await controller.run_task(
                     current_task,
@@ -891,17 +976,27 @@ async def _chat_async(
             finally:
                 thinking.stop()
 
-            # Display result on the left
-            console.print()
-            console.print(render_agent_message(result))
-
-            # Display token metrics and context summary
             stats = controller.context.get_token_stats()
-            console.print(Align.left(
-                f"  [dim]Session Tokens: [cyan]↑ {stats['tokens_up']:,} sent[/cyan]  •  "
-                f"[green]↓ {stats['tokens_down']:,} received[/green]  •  "
-                f"[magenta]{stats['total_tokens']:,} total[/magenta]  •  "
-                f"Context: [yellow]~{stats['approx_context_tokens']:,} tokens[/yellow][/dim]"
+            task_up = max(0, stats["tokens_up"] - pre_stats["tokens_up"])
+            task_down = max(0, stats["tokens_down"] - pre_stats["tokens_down"])
+            task_history.append({
+                "task": current_task,
+                "result": result,
+                "tokens_up": task_up,
+                "tokens_down": task_down,
+                "approx_context": stats["approx_context_tokens"],
+                "collapsed": tasks_collapsed,
+            })
+
+            # Display task/result on the left with tokens at the side
+            console.print()
+            console.print(render_task_with_side_tokens(
+                task=current_task,
+                result=result,
+                tokens_up=task_up,
+                tokens_down=task_down,
+                approx_context=stats["approx_context_tokens"],
+                collapsed=tasks_collapsed,
             ))
 
             # Process next queued message if available
@@ -1040,6 +1135,66 @@ async def _chat_async(
                     await _handle_queue_command(user_input.split(), controller)
                     continue
 
+                # Handle /collapse and /tasks commands
+                if user_input.strip().lower() in ("/collapse", "/expand"):
+                    tasks_collapsed = not tasks_collapsed if user_input.strip().lower() == "/collapse" else False
+                    for entry in task_history:
+                        entry["collapsed"] = tasks_collapsed
+                    state_word = "collapsed" if tasks_collapsed else "expanded"
+                    console.print(render_system_message(f"[cyan]Tasks {state_word}.[/cyan]"))
+                    for entry in task_history:
+                        console.print(render_task_with_side_tokens(
+                            task=entry["task"],
+                            result=entry["result"],
+                            tokens_up=entry["tokens_up"],
+                            tokens_down=entry["tokens_down"],
+                            approx_context=entry["approx_context"],
+                            collapsed=entry["collapsed"],
+                        ))
+                    continue
+
+                if user_input.strip().lower() == "/tasks":
+                    if not task_history:
+                        console.print(render_system_message("[dim]No completed tasks in this session yet.[/dim]"))
+                        continue
+                    while True:
+                        opts = [
+                            {
+                                "key": "__toggle_all__",
+                                "label": f"{'▾ Expand all tasks' if tasks_collapsed else '▸ Collapse all tasks'}",
+                                "pt_style": "class:accent",
+                            }
+                        ]
+                        for idx, entry in enumerate(task_history):
+                            preview = entry["task"].strip().replace("\n", " ")[:40]
+                            icon = "▸" if entry["collapsed"] else "▾"
+                            tok_badge = f"↑{format_tokens(entry['tokens_up'])} ↓{format_tokens(entry['tokens_down'])}"
+                            opts.append({
+                                "key": f"task:{idx}",
+                                "label": f"{icon} {preview:<42} [{tok_badge}]",
+                                "pt_style": "class:item" if entry["collapsed"] else "class:allow",
+                            })
+                        opts.append({"key": "__done__", "label": "← Done", "pt_style": "class:item"})
+                        picked = await _prompt_arrow_menu("Tasks (select to collapse/expand):", opts)
+                        if not picked or picked == "__done__":
+                            break
+                        if picked == "__toggle_all__":
+                            tasks_collapsed = not tasks_collapsed
+                            for entry in task_history:
+                                entry["collapsed"] = tasks_collapsed
+                        elif picked.startswith("task:"):
+                            idx = int(picked.split(":", 1)[1])
+                            task_history[idx]["collapsed"] = not task_history[idx]["collapsed"]
+                            console.print(render_task_with_side_tokens(
+                                task=task_history[idx]["task"],
+                                result=task_history[idx]["result"],
+                                tokens_up=task_history[idx]["tokens_up"],
+                                tokens_down=task_history[idx]["tokens_down"],
+                                approx_context=task_history[idx]["approx_context"],
+                                collapsed=task_history[idx]["collapsed"],
+                            ))
+                    continue
+
                 # Handle other slash commands
                 if user_input.strip().startswith("/"):
                     should_continue = await _handle_slash_command(user_input.strip(), controller)
@@ -1141,6 +1296,8 @@ SLASH_COMMANDS = {
     "/logs": "View or follow live logs of an ongoing process (/logs [id|follow])",
     "/ps": "List or stop ongoing background processes (/ps [stop <id>])",
     "/tokens": "View session tokens sent/received and approximate context length",
+    "/collapse": "Collapse or expand task outputs (with tokens shown at the side)",
+    "/tasks": "Browse tasks interactively and toggle collapse/expand per task",
     "/help": "Display all available commands",
     "/provider": "Configure AI providers (Google, NVIDIA, OpenAI, etc.)",
     "/settings": "Open interactive settings & API profiles",
@@ -1166,6 +1323,8 @@ SLASH_COMMAND_ICONS = {
     "/logs": "📜",
     "/ps": "⚙",
     "/tokens": "📊",
+    "/collapse": "▸",
+    "/tasks": "☰",
     "/help": "✦",
     "/provider": "⚡",
     "/settings": "⚙",
@@ -3174,10 +3333,10 @@ def _show_tokens_command(controller: AgentController) -> None:
     table.add_column("Metric", style="cyan", width=26)
     table.add_column("Value", style="bold white")
     table.add_column("Description", style="dim")
-    table.add_row("Tokens Sent (↑ Up)", f"{stats['tokens_up']:,}", "Input prompt tokens transmitted to model")
-    table.add_row("Tokens Received (↓ Down)", f"{stats['tokens_down']:,}", "Output completion tokens generated by model")
-    table.add_row("Total Session Tokens", f"{stats['total_tokens']:,}", "Total tokens consumed during this session")
-    table.add_row("Approx. Active Context", f"~{stats['approx_context_tokens']:,} tokens", f"Estimated active context memory ({len(controller.context.messages)} conversation items)")
+    table.add_row("Tokens Sent (↑ Up)", format_tokens(stats['tokens_up']), "Input prompt tokens transmitted to model")
+    table.add_row("Tokens Received (↓ Down)", format_tokens(stats['tokens_down']), "Output completion tokens generated by model")
+    table.add_row("Total Session Tokens", format_tokens(stats['total_tokens']), "Total tokens consumed during this session")
+    table.add_row("Approx. Active Context", f"~{format_tokens(stats['approx_context_tokens'])}", f"Estimated active context memory ({len(controller.context.messages)} conversation items)")
     console.print()
     console.print(table)
     console.print()
@@ -3197,10 +3356,10 @@ def _show_status_command(controller: AgentController) -> None:
     table.add_row("Max Iterations", str(config.max_iterations))
     table.add_row("Max Tool Calls", str(config.max_tool_calls))
     table.add_row("Queued Tasks", str(len(controller.message_queue)))
-    table.add_row("Tokens Sent (↑)", f"{stats['tokens_up']:,}")
-    table.add_row("Tokens Received (↓)", f"{stats['tokens_down']:,}")
-    table.add_row("Total Session Tokens", f"{stats['total_tokens']:,}")
-    table.add_row("Approx. Context Length", f"~{stats['approx_context_tokens']:,} tokens")
+    table.add_row("Tokens Sent (↑)", format_tokens(stats['tokens_up']))
+    table.add_row("Tokens Received (↓)", format_tokens(stats['tokens_down']))
+    table.add_row("Total Session Tokens", format_tokens(stats['total_tokens']))
+    table.add_row("Approx. Context Length", f"~{format_tokens(stats['approx_context_tokens'])}")
     table.add_row("Session", "Active")
 
     console.print()
@@ -3216,7 +3375,7 @@ def _show_config_command() -> None:
 def _show_version_command() -> None:
     """Handle /version command."""
     console.print(Panel(
-        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.1.4[/bright_green]\n"
+        "[bold bright_blue]IRERI CODE[/bold bright_blue]  [bright_green]v2.1.6[/bright_green]\n"
         "Terminal AI Coding Agent\n"
         "https://github.com/ekusafamily/ireri-code",
         title="[bold]Version Info[/bold]",

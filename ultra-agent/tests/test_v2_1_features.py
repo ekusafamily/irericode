@@ -21,8 +21,8 @@ from agent.model import ModelClient, ModelResponse
 from agent.tools import Tool, ToolArgument, ToolRegistry, ToolResult
 
 
-def test_version_is_2_1_4():
-    assert __version__ == "2.1.4"
+def test_version_is_2_1_6():
+    assert __version__ == "2.1.6"
 
 
 def test_nvidia_nim_preset_constants():
@@ -279,6 +279,151 @@ async def test_model_rate_limiter_waits_for_reset(monkeypatch):
     waited = await limiter.acquire("gemini-3.5-flash-lite", progress_callback=lambda ev, d: events.append((ev, d)))
     assert waited > 0
     assert any(ev == "rate_limit_wait" and d["rpm_limit"] == 2 for ev, d in events)
+
+
+def test_parse_response_preserves_extra_content_thought_signature():
+    client = ModelClient(api_key="test-key", base_url="http://test.local/v1", model="gemini-3.5-flash-lite")
+
+    tc = MagicMock()
+    tc.id = "call_1"
+    tc.type = "function"
+    tc.function = MagicMock()
+    tc.function.name = "list_files"
+    tc.function.arguments = '{"recursive": true}'
+    tc.extra_content = {"google": {"thought_signature": "sig_abc123"}}
+
+    msg = MagicMock()
+    msg.content = None
+    msg.tool_calls = [tc]
+    choice = MagicMock()
+    choice.message = msg
+    choice.finish_reason = "tool_calls"
+    resp = MagicMock()
+    resp.choices = [choice]
+    resp.usage = None
+
+    parsed = client._parse_response(resp)
+    assert parsed.tool_calls[0]["extra_content"] == {"google": {"thought_signature": "sig_abc123"}}
+
+
+@pytest.mark.asyncio
+async def test_direct_text_reply_does_not_force_continuation(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    mock_client = MagicMock(spec=ModelClient)
+    mock_client.model = "gemini-3.5-flash-lite"
+    mock_client.progress_callback = None
+    mock_client.chat = AsyncMock(return_value=ModelResponse(content="Bonjour! How can I help?"))
+
+    ctrl = AgentController(model_client=mock_client)
+    assert ctrl._is_conversational("hiii") is True
+    assert ctrl._is_conversational("bonjour") is True
+    assert ctrl._is_conversational("mambo") is True
+
+    res = await ctrl.run_task("tell me a joke")
+    assert res == "Bonjour! How can I help?"
+    assert mock_client.chat.call_count == 1
+
+
+def test_format_tokens_compact():
+    from agent.cli import format_tokens
+
+    assert format_tokens(0) == "0"
+    assert format_tokens(420) == "420"
+    assert format_tokens(1000) == "1k"
+    assert format_tokens(2742) == "2.7k"
+    assert format_tokens(10000) == "10k"
+    assert format_tokens(10500) == "10.5k"
+    assert format_tokens(100000) == "100k"
+    assert format_tokens(1500000) == "1.5M"
+
+
+def test_render_task_with_side_tokens_collapsed_and_expanded():
+    from agent.cli import render_task_with_side_tokens
+
+    expanded = render_task_with_side_tokens("fix bug", "Done!", 2700, 350, 3000, collapsed=False)
+    collapsed = render_task_with_side_tokens("fix bug", "Done!", 2700, 350, 3000, collapsed=True)
+    assert expanded is not None
+    assert collapsed is not None
+
+
+def test_context_prunes_old_write_file_and_trims_safely():
+    from agent.context import ContextManager
+
+    ctx = ContextManager()
+    ctx.add_system_message("sys")
+    ctx.add_user_message("build app")
+
+    big_code = "\n".join(f"print({i})" for i in range(150))
+    ctx.add_assistant_message(
+        content=None,
+        tool_calls=[{
+            "id": "call_old",
+            "type": "function",
+            "function": {"name": "write_file", "arguments": f'{{"path": "app.py", "content": "{big_code}"}}'.replace("\n", "\\n")},
+        }],
+    )
+    ctx.add_tool_result("call_old", "write_file", "x" * 2000)
+
+    # Add 14 recent messages so the old write_file falls outside keep_recent_messages=12
+    for i in range(7):
+        ctx.add_user_message(f"step {i}")
+        ctx.add_assistant_message(f"ok {i}")
+
+    formatted = ctx.get_messages_for_model(keep_recent_messages=12)
+    old_assistant = [m for m in formatted if m.get("tool_calls")][0]
+    assert "omitted" in old_assistant["tool_calls"][0]["function"]["arguments"]
+    old_tool = [m for m in formatted if m["role"] == "tool"][0]
+    assert len(old_tool["content"]) < 500
+
+    # Pair-safe trimming: assistant+tool pair is removed together if over budget
+    ctx.trim_if_needed(model_max_tokens=7000)
+    roles = [m.role for m in ctx.messages]
+    assert roles[0] == "system"
+    # Never leave an orphan 'tool' message right after 'system' or 'user'
+    for idx, r in enumerate(roles):
+        if r == "tool":
+            assert idx > 0 and (roles[idx - 1] in ("assistant", "tool"))
+
+
+@pytest.mark.asyncio
+async def test_google_tpm_and_rpd_limits(monkeypatch, tmp_path):
+    from agent.config import GOOGLE_PEAK_RPD, GOOGLE_PEAK_TPM
+    from agent.model import DailyQuotaExceededError, ModelRateLimiter
+
+    assert GOOGLE_PEAK_TPM == 220_000
+    assert GOOGLE_PEAK_RPD == 490
+
+    usage_file = tmp_path / "google_usage.json"
+    monkeypatch.setattr("agent.model.GOOGLE_USAGE_FILE", usage_file)
+
+    limiter = ModelRateLimiter(window_seconds=0.15)
+    events = []
+
+    # 1st call with 150k input tokens succeeds immediately
+    waited1 = await limiter.acquire(
+        "gemini-3.5-flash-lite",
+        est_input_tokens=150_000,
+        progress_callback=lambda ev, d: events.append((ev, d)),
+    )
+    assert waited1 == 0.0
+
+    # 2nd call with 100k input tokens exceeds 220k TPM -> waits for window reset
+    waited2 = await limiter.acquire(
+        "gemini-3.5-flash-lite",
+        est_input_tokens=100_000,
+        progress_callback=lambda ev, d: events.append((ev, d)),
+    )
+    assert waited2 > 0.0
+    assert any(ev == "rate_limit_wait" and d.get("reason") == "tpm" for ev, d in events)
+
+    # Daily RPD cap: simulate 490 requests already used today (PT)
+    limiter._daily_count = 490
+    with pytest.raises(DailyQuotaExceededError, match="490/490"):
+        await limiter.acquire("gemini-3.5-flash-lite", est_input_tokens=100)
+
+
+
+
 
 
 
